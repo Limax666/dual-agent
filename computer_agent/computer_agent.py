@@ -644,12 +644,19 @@ class ComputerAgent:
                 success = False
                 if element_info:
                     print(f"🎯 使用页面分析策略填写: {element_info.selector}")
-                    success = await self._fill_element_by_type(element_info, str(value))
+                    # 保持原始value类型，不要转换为字符串
+                    success = await self._fill_element_by_type(element_info, value)
                 
                 # 如果基于分析填写失败，使用备用策略
                 if not success:
                     print(f"🔄 使用备用策略填写字段: {field_name}")
-                    success = await self._fill_element_fallback(field_name, str(value))
+                    
+                    # 特殊处理：如果是列表值且为toppings字段，直接调用专门的方法
+                    if isinstance(value, list) and field_name.lower() in ['toppings', 'pizza_toppings']:
+                        print(f"🍕 检测到toppings列表，调用专门处理方法")
+                        success = await self._fill_multiple_toppings(value)
+                    else:
+                        success = await self._fill_element_fallback(field_name, str(value))
                 
                 if success:
                     filled_count += 1
@@ -661,14 +668,44 @@ class ComputerAgent:
             
             print(f"📊 表单填写完成，成功填写 {filled_count}/{len(form_data)} 个字段")
             
+            # 分析未成功填写的字段
+            failed_fields = []
+            if filled_count < len(form_data):
+                for field_name, value in form_data.items():
+                    # 这里需要跟踪哪些字段失败了，但由于当前架构限制，我们做一个简化处理
+                    pass
+            
             # 发送详细结果给Phone Agent
             if filled_count > 0:
                 filled_fields = [f"{k}: {v}" for k, v in form_data.items()]
                 result_text = f"已成功填写 {filled_count} 个字段: {', '.join(filled_fields[:3])}"  # 最多显示3个字段
                 if len(filled_fields) > 3:
                     result_text += f" 等{len(filled_fields)}个字段"
+            elif filled_count == 0:
+                # 特殊处理：当没有任何字段被填写时
+                missing_field_types = []
+                for field_name in form_data.keys():
+                    if field_name.lower() in ['delivery_time', 'preferred_delivery_time']:
+                        if '配送时间' not in missing_field_types:
+                            missing_field_types.append('配送时间')
+                    elif field_name.lower() in ['delivery_instructions', 'instructions', 'comments']:
+                        if '配送说明' not in missing_field_types:
+                            missing_field_types.append('配送说明')
+                    elif field_name.lower() in ['toppings', 'pizza_toppings']:
+                        if '配料选择' not in missing_field_types:
+                            missing_field_types.append('配料选择')
+                    elif field_name.lower() in ['size', 'pizza_size']:
+                        if '尺寸选择' not in missing_field_types:
+                            missing_field_types.append('尺寸选择')
+                    else:
+                        missing_field_types.append(field_name)
+                
+                if missing_field_types:
+                    result_text = f"当前表单没有以下字段：{', '.join(missing_field_types)}，无需填写这些信息"
+                else:
+                    result_text = f"未能填写任何字段，请检查页面表单结构"
             else:
-                result_text = f"未能填写任何字段，请检查页面表单结构"
+                result_text = f"部分字段填写成功 ({filled_count}/{len(form_data)})，请检查未完成的字段"
             
             response = create_info_message(
                 text=result_text,
@@ -724,21 +761,101 @@ class ComputerAgent:
         try:
             if element.element_type == ElementType.RADIO:
                 # Radio按钮需要点击而不是填写
-                radio_selector = f'[name="{element.id}"][value="{value}"]'
-                result = await self.browser.click_element(radio_selector)
-                return result.success
+                # 使用element的name属性而不是id
+                element_name = element.metadata.get("name", element.id)
+                # 确保value是字符串类型
+                radio_value = str(value) if not isinstance(value, str) else value
+                
+                # 构造多种可能的选择器
+                radio_selectors = [
+                    f'[name="{element_name}"][value="{radio_value}"]',
+                    f'input[type="radio"][name="{element_name}"][value="{radio_value}"]',
+                ]
+                
+                # 如果name包含空格，也尝试用引号包围
+                if ' ' in element_name:
+                    radio_selectors.extend([
+                        f'[name="{element_name}"][value="{radio_value}"]',
+                        f'input[type="radio"][name="{element_name}"][value="{radio_value}"]',
+                    ])
+                
+                success = False
+                for selector in radio_selectors:
+                    result = await self.browser.click_element(selector)
+                    if result.success:
+                        success = True
+                        break
+                
+                # 如果还是失败，尝试其他可能的选择器
+                if not success:
+                    # 尝试使用id作为name
+                    alt_selector = f'[name="{element.id}"][value="{radio_value}"]'
+                    result = await self.browser.click_element(alt_selector)
+                    
+                    # 如果还是失败，尝试直接使用value选择器
+                    if not result.success:
+                        value_selector = f'[value="{radio_value}"]'
+                        result = await self.browser.click_element(value_selector)
+                        success = result.success
+                    else:
+                        success = True
+                
+                return success
             
             elif element.element_type == ElementType.CHECKBOX:
-                # 复选框也需要点击
-                result = await self.browser.click_element(element.selector)
-                return result.success
+                # 复选框需要根据value判断是否点击
+                # 如果value是列表（如toppings），检查当前checkbox是否在列表中
+                if isinstance(value, list):
+                    # 对于toppings这种多选情况
+                    element_value = element.metadata.get("value", "").lower()
+                    element_name = element.metadata.get("name", element.id).lower()
+                    element_label = element.label.lower()
+                    
+                    # 检查是否应该选中这个checkbox
+                    should_check = False
+                    for v in value:
+                        v_lower = str(v).lower()
+                        if (v_lower in element_value or 
+                            v_lower in element_name or 
+                            v_lower in element_label):
+                            should_check = True
+                            break
+                    
+                    if should_check:
+                        # 构造多种可能的选择器
+                        checkbox_selectors = [
+                            element.selector,
+                        ]
+                        
+                        # 如果有name属性，添加更多选择器
+                        if element.metadata.get("name"):
+                            name = element.metadata["name"]
+                            checkbox_selectors.extend([
+                                f'[name="{name}"]',
+                                f'input[type="checkbox"][name="{name}"]',
+                            ])
+                        
+                        # 尝试每个选择器
+                        for selector in checkbox_selectors:
+                            result = await self.browser.click_element(selector)
+                            if result.success:
+                                return True
+                        return False
+                    else:
+                        return True  # 不需要选中，视为成功
+                else:
+                    # 单个checkbox，直接点击
+                    result = await self.browser.click_element(element.selector)
+                    return result.success
             
             elif element.element_type == ElementType.SELECT:
                 # 下拉选择框需要特殊处理
+                # 确保value是字符串类型
+                select_value = str(value) if not isinstance(value, str) else value
                 script = f"""
                 const select = document.querySelector('{element.selector}');
                 if (select) {{
-                    select.value = '{value}';
+                    select.value = '{select_value}';
                     select.dispatchEvent(new Event('change'));
                     return true;
                 }}
@@ -749,7 +866,9 @@ class ComputerAgent:
             
             else:
                 # 文本输入类元素
-                result = await self.browser.type_text(element.selector, value)
+                # 如果value是列表，转换为字符串
+                text_value = str(value) if not isinstance(value, str) else value
+                result = await self.browser.type_text(element.selector, text_value)
                 return result.success
                 
         except Exception as e:
@@ -774,7 +893,17 @@ class ComputerAgent:
             f'[name="{field_name}"]',
             f'#{field_name}',
             f'[id*="{field_name}"]',
-            f'[placeholder*="{field_name}"]'
+            f'[placeholder*="{field_name}"]',
+            # 添加针对pizza表单的通用选择器
+            f'[name="pizza {field_name}"]',  # 如 "pizza size", "pizza toppings"
+            f'[id="pizza {field_name}"]',
+            f'[name*="pizza {field_name}"]',
+            f'[id*="pizza {field_name}"]',
+            # 添加针对preferred字段的选择器
+            f'[name="preferred {field_name}"]',  # 如 "preferred delivery time" 
+            f'[id="preferred {field_name}"]',
+            f'[name*="preferred {field_name}"]',
+            f'[id*="preferred {field_name}"]',
         ]
         
         # 针对姓名字段的特殊处理
@@ -813,6 +942,123 @@ class ComputerAgent:
             ]
             base_selectors.extend(phone_selectors)
         
+        # 针对pizza size字段的特殊处理
+        elif field_name.lower() in ['size', 'pizza_size']:
+            size_selectors = [
+                '[name*="size"]',
+                '[id*="size"]',
+                '[name="pizza size"]',  # 添加带空格的实际ID
+                '[id="pizza size"]',    # 添加带空格的实际ID
+                '[name*="pizza size"]',
+                '[id*="pizza size"]',
+                f'[value="{value}"]',  # 直接按value查找radio
+                f'input[type="radio"][value="{value}"]',  # 明确指定radio类型
+                f'input[type="radio"][name="pizza size"][value="{value}"]',  # 实际结构
+                f'input[type="radio"][name*="pizza size"][value="{value}"]',
+                f'input[type="radio"][name*="size"][value="{value}"]',
+            ]
+            base_selectors.extend(size_selectors)
+        
+        # 针对pizza toppings字段的特殊处理  
+        elif field_name.lower() in ['toppings', 'pizza_toppings']:
+            if isinstance(value, list):
+                # 对于多个toppings，需要特殊处理
+                return await self._fill_multiple_toppings(value)
+            else:
+                topping_selectors = [
+                    '[name*="topping"]',
+                    '[id*="topping"]',
+                    '[name="pizza toppings"]',  # 添加带空格的实际ID
+                    '[id="pizza toppings"]',    # 添加带空格的实际ID
+                    '[name*="pizza toppings"]',
+                    '[id*="pizza toppings"]',
+                    f'[value="{value}"]',
+                    f'input[type="checkbox"][value="{value}"]',
+                ]
+                base_selectors.extend(topping_selectors)
+        
+        # 针对配送时间字段的特殊处理
+        elif field_name.lower() in ['delivery_time', 'preferred_delivery_time', 'delivery', 'time']:
+            delivery_selectors = [
+                # 最精确的匹配（优先尝试）
+                'input[name="preferred delivery time"]',  # 精确匹配完整字段名
+                'select[name="preferred delivery time"]',
+                'input[id="preferred delivery time"]',
+                'select[id="preferred delivery time"]',
+                
+                # 部分匹配的高优先级选择器
+                'input[name*="preferred"][name*="delivery"][name*="time"]',
+                'select[name*="preferred"][name*="delivery"][name*="time"]',
+                'input[name*="preferred delivery time"]',
+                'select[name*="preferred delivery time"]',
+                'input[id*="preferred delivery time"]',
+                'select[id*="preferred delivery time"]',
+                
+                # 标准的delivery time匹配
+                'input[name="delivery time"]',
+                'select[name="delivery time"]',
+                'input[id="delivery time"]',
+                'select[id="delivery time"]',
+                'input[name*="delivery time"]',
+                'select[name*="delivery time"]',
+                'input[id*="delivery time"]',
+                'select[id*="delivery time"]',
+                
+                # 基础选择器
+                'input[name*="delivery"]',
+                'select[name*="delivery"]',
+                'input[id*="delivery"]',
+                'select[id*="delivery"]',
+                'input[name*="time"]',
+                'select[name*="time"]',
+                'input[id*="time"]',
+                'select[id*="time"]',
+                
+                # HTML5时间类型（高优先级）
+                'input[type="time"]',  # HTML5时间输入
+                'input[type="datetime-local"]',  # 日期时间输入
+                
+                # 按placeholder匹配
+                'input[placeholder*="time"]',
+                'input[placeholder*="时间"]',
+                'input[placeholder*="delivery"]',
+                'input[placeholder*="配送"]',
+                'select[placeholder*="time"]',
+                'select[placeholder*="时间"]',
+                
+                # 按class匹配
+                'input[class*="delivery"]',
+                'select[class*="delivery"]',
+                'input[class*="time"]',
+                'select[class*="time"]',
+                '[class*="delivery"]',
+                '[class*="time"]',
+                
+                # 最宽泛的匹配
+                'input[type="text"][pattern*="time"]',
+                'textarea[name*="delivery"]',
+                'textarea[name*="time"]',
+            ]
+            base_selectors.extend(delivery_selectors)
+        
+        # 针对配送说明字段的特殊处理
+        elif field_name.lower() in ['delivery_instructions', 'instructions', 'comments']:
+            instructions_selectors = [
+                '[name*="instruction"]',
+                '[id*="instruction"]',
+                '[name*="comment"]',
+                '[id*="comment"]',
+                '[name="delivery instructions"]',  # 完整的实际ID
+                '[id="delivery instructions"]',    # 完整的实际ID
+                '[name*="delivery instructions"]',
+                '[id*="delivery instructions"]',
+                'textarea[name*="instruction"]',  # 可能是文本域
+                'textarea[id*="instruction"]',
+                'textarea[name*="comment"]',
+                'textarea[id*="comment"]',
+            ]
+            base_selectors.extend(instructions_selectors)
+        
         # 去重
         selectors = list(dict.fromkeys(base_selectors))
         print(f"🎯 尝试 {len(selectors)} 个选择器策略")
@@ -829,19 +1075,140 @@ class ComputerAgent:
                     print(f"   失败: {result.message}")
                 
                 # 如果填写失败，可能是radio或checkbox，尝试点击
-                if "radio" in result.message.lower() or "checkbox" in result.message.lower():
-                    # 尝试点击对应值的radio按钮
-                    radio_selector = f'{selector}[value="{value}"]'
-                    click_result = await self.browser.click_element(radio_selector)
+                if "radio" in result.message.lower() or "checkbox" in result.message.lower() or field_name.lower() in ['size', 'pizza_size', 'toppings', 'pizza_toppings']:
+                    # 先尝试点击对应值的radio/checkbox按钮
+                    value_selector = f'{selector}[value="{value}"]'
+                    click_result = await self.browser.click_element(value_selector)
                     if click_result.success:
-                        print(f"✅ Radio按钮点击成功: {radio_selector}")
+                        print(f"✅ Radio/Checkbox按钮点击成功: {value_selector}")
+                        return True
+                    
+                    # 如果还是失败，尝试直接点击元素（不带value）
+                    click_result = await self.browser.click_element(selector)
+                    if click_result.success:
+                        print(f"✅ 元素点击成功: {selector}")
                         return True
             except Exception as e:
                 print(f"   异常: {str(e)}")
                 continue
         
         print(f"❌ 所有备用策略都失败了")
+        
+        # 智能失败处理：为特定字段类型提供有意义的反馈
+        field_type_feedback = {
+            'delivery_time': '该表单没有配送时间选择字段',
+            'preferred_delivery_time': '该表单没有配送时间选择字段', 
+            'delivery_instructions': '该表单没有配送说明字段',
+            'toppings': '该表单没有配料选择字段',
+            'pizza_toppings': '该表单没有配料选择字段',
+            'size': '该表单没有尺寸选择字段',
+            'pizza_size': '该表单没有尺寸选择字段',
+        }
+        
+        feedback = field_type_feedback.get(field_name.lower(), f'该表单没有匹配的 {field_name} 字段')
+        print(f"💡 智能反馈: {feedback}")
+        
         return False
+    
+    async def _fill_multiple_toppings(self, toppings: List[str]) -> bool:
+        """
+        填写多个pizza toppings
+        
+        参数:
+            toppings: toppings列表
+            
+        返回:
+            是否成功
+        """
+        print(f"🍕 处理多个toppings: {toppings}")
+        success_count = 0
+        
+        for topping in toppings:
+            topping_lower = topping.lower()
+            print(f"🔍 处理topping: {topping}")
+            
+            # 扩展的checkbox选择器，基于实际HTML结构
+            topping_selectors = [
+                # 按value匹配
+                f'[value="{topping}"]',
+                f'[value="{topping_lower}"]', 
+                f'[value="{topping.title()}"]',  # 首字母大写
+                f'[value="{topping.upper()}"]',  # 全大写
+                
+                # 按name匹配 - 包含带空格的实际ID
+                f'[name="{topping_lower}"]',
+                f'[name*="{topping_lower}"]',
+                f'[name="pizza toppings"]',  # 实际的HTML name
+                f'[name*="pizza toppings"]',
+                f'[name*="topping"]',
+                
+                # 按id匹配 - 包含带空格的实际ID
+                f'[id="{topping_lower}"]',
+                f'[id*="{topping_lower}"]',
+                f'[id="pizza toppings"]',   # 实际的HTML id
+                f'[id*="pizza toppings"]',
+                f'[id*="topping"]',
+                
+                # 明确指定checkbox类型
+                f'input[type="checkbox"][value="{topping}"]',
+                f'input[type="checkbox"][value="{topping_lower}"]',
+                f'input[type="checkbox"][value="{topping.title()}"]',
+                f'input[type="checkbox"][name*="{topping_lower}"]',
+                f'input[type="checkbox"][name="pizza toppings"]',  # 实际的HTML结构
+                f'input[type="checkbox"][name*="pizza toppings"]',
+                f'input[type="checkbox"][name*="topping"]',
+                
+                # 通用的topping选择器
+                f'input[type="checkbox"][name*="topping"][value*="{topping_lower}"]',
+                f'input[type="checkbox"][id*="topping"][value*="{topping_lower}"]',
+            ]
+            
+            # 特殊映射处理 - 扩展更多可能的值
+            topping_mapping = {
+                'bacon': ['bacon', 'Bacon', 'BACON'],
+                'cheese': ['cheese', 'Cheese', 'CHEESE', 'Extra Cheese', 'extra cheese', 'extra_cheese'],
+                'onion': ['onion', 'Onion', 'ONION'],
+                'mushroom': ['mushroom', 'Mushroom', 'MUSHROOM', 'mushrooms', 'Mushrooms']
+            }
+            
+            if topping_lower in topping_mapping:
+                for mapped_value in topping_mapping[topping_lower]:
+                    topping_selectors.extend([
+                        f'[value="{mapped_value}"]',
+                        f'input[type="checkbox"][value="{mapped_value}"]',
+                        f'input[name*="{mapped_value.lower()}"]',
+                        f'input[id*="{mapped_value.lower()}"]',
+                        # 添加针对"pizza toppings"的特殊选择器
+                        f'input[type="checkbox"][name="pizza toppings"][value="{mapped_value}"]',
+                        f'input[type="checkbox"][name*="pizza toppings"][value="{mapped_value}"]',
+                        f'input[type="checkbox"][id="pizza toppings"][value="{mapped_value}"]',
+                        f'input[type="checkbox"][id*="pizza toppings"][value="{mapped_value}"]',
+                    ])
+            
+            # 尝试每个选择器
+            topping_success = False
+            for i, selector in enumerate(topping_selectors):
+                print(f"    {i+1}. 尝试选择器: {selector}")
+                try:
+                    result = await self.browser.click_element(selector, timeout=2000)  # 短超时
+                    if result.success:
+                        print(f"✅ Topping成功选中: {topping} (选择器: {selector})")
+                        success_count += 1
+                        topping_success = True
+                        break
+                    else:
+                        print(f"    失败: {result.message}")
+                except Exception as e:
+                    print(f"    异常: {str(e)}")
+                    continue
+            
+            if not topping_success:
+                print(f"❌ Topping选择失败: {topping}")
+                # 记录所有尝试过的选择器用于调试
+                print(f"    尝试了 {len(topping_selectors)} 个选择器都失败")
+        
+        print(f"📊 Toppings处理完成: {success_count}/{len(toppings)} 成功")
+        return success_count > 0
     
     async def click_element(self, selector: str, task_id: str) -> None:
         """
@@ -1057,23 +1424,57 @@ class ComputerAgent:
         if emails:
             user_data["email"] = emails[0]
             user_data["custemail"] = emails[0]  # 添加常见的表单字段名
+        else:
+            # 如果没有找到标准格式，尝试提取用户明确说明的邮箱
+            email_statement_patterns = [
+                r'(?:邮箱是|邮箱为|email是|email为|电子邮箱是)([^\s,，。]+)',
+                r'(?:邮箱|email)[:：]([^\s,，。]+)',
+                r'(?:填写|填入)(?:邮箱|email)([^\s,，。]+)',
+            ]
+            
+            for pattern in email_statement_patterns:
+                matches = re.findall(pattern, text, re.IGNORECASE)
+                if matches:
+                    email_value = matches[0].strip()
+                    if email_value:
+                        user_data["email"] = email_value
+                        user_data["custemail"] = email_value
+                    break
         
         # 电话号码匹配 - 改进的模式
         phone_patterns = [
             r'\b(?:\+?86[-.\s]?)?1[3-9]\d{9}\b',  # 中国手机号
             r'\b(?:\+?1[-.\s]?)?\(?[0-9]{3}\)?[-.\s]?[0-9]{3}[-.\s]?[0-9]{4}\b',  # 美国电话
-            r'(?:电话|手机|联系方式)(?:是|为|号码是)([0-9]{4,15})',  # 新增：电话是123456
-            r'(?:填写|填入)(?:电话|手机)([0-9]{4,15})',          # 新增：填写电话123456
-            r'([0-9]{6,15})(?:是我的电话|是我的手机)',            # 新增：123456是我的电话
         ]
         
+        phone_found = False
         for pattern in phone_patterns:
             phones = re.findall(pattern, text)
             if phones:
                 phone = re.sub(r'[-.\s\(\)]', '', phones[0])  # 清理格式
                 user_data["phone"] = phone
                 user_data["custtel"] = phone  # 添加常见的表单字段名
+                phone_found = True
                 break
+        
+        # 如果没有找到标准格式，尝试提取用户明确说明的电话
+        if not phone_found:
+            phone_statement_patterns = [
+                r'(?:电话是|电话号码是|电话为|电话号码为|手机是|手机号码是|手机为|手机号码为|联系方式是)([0-9]+)',
+                r'(?:电话|手机|联系方式)[:：]([0-9]+)',
+                r'(?:填写|填入)(?:电话|手机)([0-9]+)',
+                r'([0-9]{4,15})(?:是我的电话|是我的手机)',
+            ]
+            
+            for pattern in phone_statement_patterns:
+                phones = re.findall(pattern, text, re.IGNORECASE)
+                if phones:
+                    phone = re.sub(r'[-.\s\(\)]', '', phones[0])
+                    if len(phone) >= 4:  # 至少4位数字
+                        user_data["phone"] = phone
+                        user_data["custtel"] = phone
+                        phone_found = True
+                    break
         
         # 名字匹配 - 改进的逻辑
         name_patterns = [
@@ -1115,6 +1516,120 @@ class ComputerAgent:
             if matches:
                 company = matches[0].strip()
                 user_data["company"] = company
+                break
+        
+        # Pizza尺寸匹配
+        size_patterns = [
+            r'(?:披萨|pizza)(?:尺寸|大小|size)(?:是|选择|要|为)?(小号|中号|大号|small|medium|large)',
+            r'(?:选择|要|想要)(?:小号|中号|大号|small|medium|large)(?:的)?(?:披萨|pizza)?',
+            r'(?:尺寸|大小|size)(?:是|选择|要|为)?(小号|中号|大号|small|medium|large)',
+            r'(小号|中号|大号|small|medium|large)(?:披萨|pizza|的披萨)?',
+        ]
+        
+        for pattern in size_patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            if matches:
+                size_value = matches[0].strip().lower()
+                # 标准化尺寸值
+                size_mapping = {
+                    '小号': 'small', '中号': 'medium', '大号': 'large',
+                    'small': 'small', 'medium': 'medium', 'large': 'large'
+                }
+                if size_value in size_mapping:
+                    user_data["size"] = size_mapping[size_value]
+                    user_data["pizza_size"] = size_mapping[size_value]  # 备用字段名
+                break
+        
+        # Pizza配料匹配
+        toppings_patterns = [
+            r'(?:配料|topping|toppings?)(?:是|要|选择|加)([^,，。]+)',
+            r'(?:加|要|选择)(?:配料|topping)?([^,，。]*(?:培根|bacon|奶酪|cheese|洋葱|onion|蘑菇|mushroom)[^,，。]*)',
+            r'(培根|bacon|奶酪|cheese|洋葱|onion|蘑菇|mushroom)(?:配料)?',
+        ]
+        
+        toppings = []
+        for pattern in toppings_patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            for match in matches:
+                topping_text = match.strip().lower()
+                # 标准化配料名称
+                topping_mapping = {
+                    '培根': 'bacon', 'bacon': 'bacon',
+                    '奶酪': 'cheese', 'cheese': 'cheese', 'extra cheese': 'cheese',
+                    '洋葱': 'onion', 'onion': 'onion', 
+                    '蘑菇': 'mushroom', 'mushroom': 'mushroom'
+                }
+                for key, value in topping_mapping.items():
+                    if key in topping_text and value not in toppings:
+                        toppings.append(value)
+        
+        if toppings:
+            extracted["toppings"] = toppings
+            # 不要重复添加 pizza_toppings，避免重复处理
+            print(f"   🍕 提取Pizza配料: {toppings}")
+        else:
+            print(f"   ❌ 未找到Pizza配料")
+        
+        # 送达时间匹配
+        delivery_time_patterns = [
+            # 明确的时间格式
+            r'(?:送达时间|delivery time|配送时间)(?:是|为|选择)?([0-9]{1,2}[:\：][0-9]{2})',
+            r'(?:时间|time)(?:是|为|选择)?([0-9]{1,2}[:\：][0-9]{2})',
+            r'([0-9]{1,2}[:\：][0-9]{2})(?:送达|配送)',
+            
+            # 简单时点表达
+            r'(?:送达时间|delivery time|配送时间)(?:是|为|选择)?([0-9]{1,2}点)',
+            r'(?:时间|time)(?:是|为|选择)?([0-9]{1,2}点)',
+            r'([0-9]{1,2}点)(?:送达|配送)',
+            r'(?:选择|要|在)([0-9]{1,2}点)',
+            
+            # 通用时间提取
+            r'(?:送达时间|delivery time|配送时间)(?:是|为|选择)?([^,，。]+)',
+        ]
+        
+        for pattern in delivery_time_patterns:
+            matches = re.findall(pattern, text)
+            if matches:
+                time_value = matches[0].strip()
+                
+                # 标准化时间格式
+                if "点" in time_value:
+                    # 将"12点"转换为"12:00"
+                    hour = re.findall(r'([0-9]{1,2})点', time_value)
+                    if hour:
+                        normalized_time = f"{hour[0]}:00"
+                    else:
+                        normalized_time = time_value
+                elif "选择" in time_value:
+                    # 去除"选择"等前缀词
+                    clean_time = time_value.replace("选择", "").strip()
+                    if "点" in clean_time:
+                        hour = re.findall(r'([0-9]{1,2})点', clean_time)
+                        if hour:
+                            normalized_time = f"{hour[0]}:00"
+                        else:
+                            normalized_time = clean_time
+                    else:
+                        normalized_time = clean_time
+                else:
+                    normalized_time = time_value
+                
+                user_data["delivery_time"] = normalized_time
+                user_data["preferred_delivery_time"] = normalized_time  # 添加这个字段以匹配实际网页
+                break
+        
+        # 配送说明匹配
+        delivery_instructions_patterns = [
+            r'(?:配送说明|delivery instructions|送货说明)(?:是|为)?([^,，。]+)',
+            r'(?:说明|instructions|备注|comments?)([^,，。]+)',
+        ]
+        
+        for pattern in delivery_instructions_patterns:
+            matches = re.findall(pattern, text)
+            if matches:
+                instructions = matches[0].strip()
+                user_data["delivery_instructions"] = instructions
+                # 不要重复添加 comments，避免重复处理
                 break
         
         self.log(f"从文本'{text[:50]}...'中提取数据: {user_data}")
