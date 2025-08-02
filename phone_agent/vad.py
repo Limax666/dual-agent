@@ -23,7 +23,8 @@ class SileroVAD:
         device: str = "cpu",
         min_speech_duration_ms: int = 250,
         min_silence_duration_ms: int = 500,
-        window_size_samples: int = 512
+        window_size_samples: int = 512,
+        noise_threshold: float = 0.02  # 新增：噪声阈值
     ):
         """
         初始化Silero VAD
@@ -35,6 +36,7 @@ class SileroVAD:
             min_speech_duration_ms: 最小语音持续时长(毫秒)
             min_silence_duration_ms: 最小静默持续时长(毫秒)
             window_size_samples: 处理窗口大小
+            noise_threshold: 音频噪声阈值，低于此值的音频被认为是噪声
         """
         self.threshold = threshold
         self.sampling_rate = sampling_rate
@@ -42,6 +44,7 @@ class SileroVAD:
         self.min_speech_duration_ms = min_speech_duration_ms
         self.min_silence_duration_ms = min_silence_duration_ms
         self.window_size_samples = window_size_samples
+        self.noise_threshold = noise_threshold  # 新增
         
         # 加载Silero VAD模型
         self.model, utils = torch.hub.load(
@@ -86,10 +89,20 @@ class SileroVAD:
         if len(audio_chunk) < self.window_size_samples:
             return False
         
+        # 首先检查音频能量，过滤低能量噪声
+        audio_energy = torch.mean(torch.abs(audio_chunk)).item()
+        if audio_energy < self.noise_threshold:
+            return False
+        
         # 运行VAD模型
         speech_prob = self.model(audio_chunk, self.sampling_rate).item()
         
-        return speech_prob >= self.threshold
+        # 对于低能量音频，提高阈值要求
+        effective_threshold = self.threshold
+        if audio_energy < self.noise_threshold * 3:  # 能量较低时
+            effective_threshold = min(0.8, self.threshold + 0.2)  # 提高阈值
+        
+        return speech_prob >= effective_threshold
     
     def get_timestamps(self, audio: torch.Tensor) -> List[dict]:
         """

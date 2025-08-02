@@ -84,17 +84,30 @@ class MixedThinkingEngine:
             if not self.api_key:
                 raise ValueError(f"请为{provider.name}提供API密钥")
 
-        self.client = AsyncOpenAI(api_key=self.api_key, base_url=self.api_base)
+        # 创建客户端时不传递可能导致冲突的参数
+        client_kwargs = {
+            "api_key": self.api_key,
+            "base_url": self.api_base
+        }
+        self.client = AsyncOpenAI(**client_kwargs)
         
-        self.system_prompt = system_prompt or """你是一个乐于助人的AI助手，专门负责协助用户与网页表单交互。
+        self.system_prompt = system_prompt or """你是一个通用的AI助手，能够协助用户与各种网页进行交互。
 
-重要指引：
-1. 你会收到来自Computer Agent的实时页面信息，包括页面标题、表单数量和详细的表单字段信息
-2. 请始终基于这些真实的页面信息与用户沟通，不要提及不存在的页面或表单字段
-3. 当用户提供表单信息时，请根据实际页面的表单字段引导用户填写
-4. 快思考阶段：给出简短、自然的回应，基于真实表单字段
-5. 深度思考阶段：可以进行更详细的分析，但必须基于实际页面内容
-6. 绝对不要提及页面上不存在的字段，如"主题"、"消息内容"等，除非Computer Agent明确提供了这些字段信息"""
+核心原则 - 完全依赖Computer Agent的实时分析：
+1. 你完全不知道当前网页的内容 - 所有页面信息都来自Computer Agent的实时分析
+2. 绝对不要预设任何表单字段（如姓名、邮箱、电话）- 必须等待Computer Agent告知实际字段
+3. 当用户开始交互时，如果没有页面信息，主动请求Computer Agent分析当前页面
+4. 根据Computer Agent提供的实际页面信息来引导用户，包括：
+   - 页面类型（表单、商品、服务等）
+   - 实际可用的输入字段和选项
+   - 具体的操作指导
+5. 快思考：基于实际页面信息给出简短回应
+6. 深度思考：请求Computer Agent进行页面分析或执行具体操作
+
+通用性要求：
+- 适应任何类型的网页（购物、预订、注册、搜索等）
+- 根据实际页面内容调整交互方式
+- 不要假设任何特定的业务场景"""
         self.conversation_history = [{"role": "system", "content": self.system_prompt}]
         self.log(f"思考引擎初始化完成，提供商: {provider.name}, API: {self.api_base}")
         self.log(f"快思考模型: {self.fast_model_name}, 慢思考模型: {self.deep_model_name}")
@@ -110,7 +123,7 @@ class MixedThinkingEngine:
         self.conversation_history = [{"role": "system", "content": self.system_prompt}]
 
     async def think(self, message_queue=None, user_text="") -> Tuple[str, str]:
-        """同时执行快思考和深度思考，并在快思考完成后立即处理表单信息"""
+        """同时执行快思考和深度思考，并支持工具调用发送消息给Computer Agent"""
         print("🤔 思考引擎开始工作...")
         print(f"💭 对话历史长度: {len(self.conversation_history)} 条消息")
         
@@ -125,27 +138,177 @@ class MixedThinkingEngine:
                 print(f"   {role}: {content}...")
         
         print("🚀 启动快思考和深度思考...")
-        fast_task = asyncio.create_task(self._fast_think(messages))
-        deep_task = asyncio.create_task(self._deep_think(messages))
+        
+        # 为快思考和深度思考添加工具调用能力
+        tools = self._get_available_tools()
+        
+        fast_task = asyncio.create_task(self._fast_think_with_tools(messages, tools))
+        deep_task = asyncio.create_task(self._deep_think_with_tools(messages, tools))
         
         try:
             # 等待快思考完成
-            fast_response = await fast_task
+            fast_response, fast_tool_calls = await fast_task
             print(f"⚡ 快思考完成: '{fast_response[:50]}...'")
             
-            # 快思考完成后立即进行表单信息提取和发送
-            if message_queue and user_text:
-                await self._extract_and_send_form_data_fast(message_queue, user_text, fast_response)
+            # 处理快思考的工具调用
+            if fast_tool_calls and user_text:
+                await self._handle_tool_calls(fast_tool_calls, user_text, from_fast_thinking=True)
             
             # 等待深度思考完成
-            deep_response = await deep_task
+            deep_response, deep_tool_calls = await deep_task
             print(f"✅ 思考完成 - 快速: {len(fast_response)}字符, 深度: {len(deep_response)}字符")
+            
+            # 处理深度思考的工具调用
+            if deep_tool_calls and user_text:
+                await self._handle_tool_calls(deep_tool_calls, user_text, from_fast_thinking=False)
+                
             return fast_response, deep_response
+            
         except Exception as e:
             print(f"❌ 思考过程出错: {e}")
             import traceback
             traceback.print_exc()
             return "抱歉，我现在无法回应。", ""
+    
+    def _get_available_tools(self) -> List[Dict[str, Any]]:
+        """获取可用的工具列表"""
+        from dual_agent.common.tool_calling import PHONE_AGENT_TOOLS
+        return PHONE_AGENT_TOOLS
+    
+    async def _fast_think_with_tools(self, messages: List[Dict[str, str]], tools: List[Dict]) -> Tuple[str, Optional[List[Dict]]]:
+        """带工具调用的快思考"""
+        try:
+            print(f"⚡ 启动快思考 (模型: {self.fast_model_name})...")
+            self.log(f"启动快思考 (模型: {self.fast_model_name})...")
+            
+            response = await self.client.chat.completions.create(
+                model=self.fast_model_name,
+                messages=messages,
+                tools=tools,
+                tool_choice="auto",  # 让模型自动决定是否调用工具
+                stream=False,  # 工具调用时不使用流式
+                max_tokens=200,
+                temperature=0.7,
+                timeout=15
+            )
+            
+            message = response.choices[0].message
+            content = message.content or ""
+            tool_calls = message.tool_calls if hasattr(message, 'tool_calls') else None
+            
+            print(f"⚡ 快思考完成: '{content[:50]}...'")
+            if tool_calls:
+                print(f"🔧 快思考生成了 {len(tool_calls)} 个工具调用")
+                
+            self.log(f"快思考完成: {content}")
+            return content.strip(), tool_calls
+            
+        except Exception as e:
+            print(f"❌ 快思考出错: {e}")
+            self.log(f"快思考出错: {e}")
+            import traceback
+            traceback.print_exc()
+            return "嗯...", None
+    
+    async def _deep_think_with_tools(self, messages: List[Dict[str, str]], tools: List[Dict]) -> Tuple[str, Optional[List[Dict]]]:
+        """带工具调用的深度思考"""
+        try:
+            print(f"🧠 启动深度思考 (模型: {self.deep_model_name})...")
+            self.log(f"启动深度思考 (模型: {self.deep_model_name})...")
+            
+            # 为深度思考添加更详细的系统提示
+            enhanced_messages = messages.copy()
+            if enhanced_messages[0]["role"] == "system":
+                enhanced_messages[0]["content"] += """
+
+请进行深入思考，考虑以下要点：
+1. 理解用户的真实意图
+2. 分析所需的具体操作步骤  
+3. 如果用户提供了表单信息，请使用send_message_to_computer_agent工具发送给Computer Agent
+4. 提供准确、详细的回应"""
+            
+            response = await self.client.chat.completions.create(
+                model=self.deep_model_name,
+                messages=enhanced_messages,
+                tools=tools,
+                tool_choice="auto",
+                stream=False,
+                max_tokens=1000,
+                temperature=0.3,
+                timeout=30
+            )
+            
+            message = response.choices[0].message
+            content = message.content or ""
+            tool_calls = message.tool_calls if hasattr(message, 'tool_calls') else None
+            
+            print(f"🧠 深度思考完成: '{content[:50]}...'")
+            if tool_calls:
+                print(f"🔧 深度思考生成了 {len(tool_calls)} 个工具调用")
+                
+            self.log(f"深度思考完成: {content}")
+            return content.strip(), tool_calls
+            
+        except Exception as e:
+            print(f"❌ 深度思考出错: {e}")
+            self.log(f"深度思考出错: {e}")
+            import traceback
+            traceback.print_exc()
+            return "让我想想...啊，抱歉，我刚刚走神了。", None
+    
+    async def _handle_tool_calls(self, tool_calls: List[Dict], user_text: str, from_fast_thinking: bool = False):
+        """处理工具调用"""
+        try:
+            from dual_agent.common.tool_calling import send_message_to_computer_agent
+            
+            for tool_call in tool_calls:
+                function_name = tool_call.function.name
+                function_args = json.loads(tool_call.function.arguments)
+                
+                print(f"🔧 执行工具调用: {function_name}")
+                print(f"   参数: {function_args}")
+                
+                if function_name == "send_message_to_computer_agent":
+                    # 添加原始用户输入到参数中
+                    function_args["additional_data"] = function_args.get("additional_data", {})
+                    function_args["additional_data"]["original_user_input"] = user_text
+                    function_args["additional_data"]["from_fast_thinking"] = from_fast_thinking
+                    
+                    # 调用工具函数
+                    result = await send_message_to_computer_agent(**function_args)
+                    
+                    if result.get("success"):
+                        print(f"✅ 工具调用成功: {function_name}")
+                    else:
+                        print(f"❌ 工具调用失败: {result.get('error')}")
+                        
+        except Exception as e:
+            print(f"❌ 处理工具调用时出错: {e}")
+            self.log(f"处理工具调用失败: {e}")
+
+    async def _fast_think_simple(self, prompt: str) -> Tuple[str, str]:
+        """简单快思考 - 用于消息转换等简单任务"""
+        try:
+            messages = [
+                {"role": "system", "content": "你是一个专门处理消息转换的助手，请按照用户要求精确转换消息。"},
+                {"role": "user", "content": prompt}
+            ]
+            
+            response = await self.client.chat.completions.create(
+                model=self.fast_model_name,
+                messages=messages,
+                stream=False,  # 不使用流式以简化处理
+                max_tokens=100,  # 消息转换通常不需要太多token
+                temperature=0.3,  # 低温度确保一致性
+                timeout=8  # 8秒超时
+            )
+            
+            content = response.choices[0].message.content or ""
+            return content.strip(), content.strip()
+            
+        except Exception as e:
+            self.log(f"简单快思考失败: {e}")
+            return "", ""
 
     async def _fast_think(self, messages: List[Dict[str, str]]) -> str:
         """快思考路径 - 优化用于低延迟快速响应"""

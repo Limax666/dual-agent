@@ -78,47 +78,59 @@
 ### 2.2 Computer Agent 设计
 
 #### 2.2.1 组件构成
-- **多模态LLM**: 处理屏幕截图和DOM结构，理解网页内容和布局
-- **浏览器自动化**: 基于browser-use或Playwright框架实现浏览器操作
-  - 支持元素定位、点击、输入、滚动等基本操作
-  - 能够提取页面内容和结构信息
+- **Browser Automation框架**: 集成现成的开源浏览器自动化框架
+  - **主选方案**: [Anthropic Computer Use](https://github.com/anthropics/anthropic-computer-use) - Anthropic官方计算机操作框架
+  - **备选方案**: [Browser-Use](https://github.com/BrowserUse/browser-use) - 专业的浏览器自动化框架
+  - 禁止自研实现，必须基于现有成熟框架
+- **智能LLM分析器**: 使用LLM分析用户输入并生成操作指令
+  - 直接理解用户的自然语言描述
+  - 智能推断表单字段和填写内容
+  - 生成具体的浏览器操作指令
 - **状态管理**: 跟踪当前操作状态和执行进度
 - **异常处理**: 处理页面加载失败、元素不可见等异常情况
 
 #### 2.2.2 工作模式
-- **页面分析**: 基于网页截图和DOM分析页面结构，识别关键元素
-- **表单操作**: 根据来自Phone Agent的信息执行表单填写操作
-- **操作验证**: 执行操作后验证是否成功，并处理可能的错误情况
+- **智能页面分析**: 
+  - 使用选定框架的视觉识别能力分析页面
+  - 由LLM理解页面结构和表单布局
+  - 识别所有可交互元素和表单字段
+- **LLM驱动的表单操作**: 
+  - **禁止硬编码**: 完全禁止使用字符串匹配等硬编码方式
+  - **LLM智能解析**: 让LLM直接分析用户输入，理解用户意图
+  - **自然语言理解**: LLM从用户的自然语言中提取表单信息
+  - **动态操作生成**: 基于LLM分析结果生成具体的浏览器操作
+- **框架驱动操作**: 使用选定框架执行具体的浏览器操作
+- **智能验证**: 操作后由LLM分析结果并验证成功性
 - **状态报告**: 将操作结果和当前状态及时反馈给Phone Agent
 
 ### 2.3 通信机制
 
-#### 2.3.1 基于Google A2A协议的消息通道
-- **协议设计**: 采用Google Agent-to-Agent(A2A)通信协议设计思想
-  - 使用标准化的JSON格式消息结构
-  - 支持异步通信和实时状态更新
-  - 提供可靠的消息传递和错误处理机制
-- **消息类型**:
-  - `Task`: 代表一个需要执行的任务，包含唯一ID和详细信息
-  - `Message`: 代表Agent之间的通信内容，包含多种模态
-  - `Artifact`: 代表任务执行产生的结果或中间产物
-  - `Part`: 消息或结果的基本组成单位，支持文本、结构化数据等
-- **消息结构**: 
+#### 2.3.1 基于工具调用(Tool-use)的Agent间通信
+- **通信方式**: 两个Agent通过工具调用进行通信，确保标准化和可靠性
+  - **Phone Agent**: 调用 `send_message_to_computer_agent` 工具发送消息给Computer Agent
+  - **Computer Agent**: 调用 `send_message_to_phone_agent` 工具发送消息给Phone Agent
+- **工具调用格式**: 
   ```json
   {
-    "source": "phone|computer",
-    "type": "info|error|request|status|action",
-    "task_id": "unique_identifier",
-    "content": { ... },
-    "timestamp": 1633456789
+    "tool_name": "send_message_to_computer_agent", 
+    "parameters": {
+      "message": "用户说他的名字叫张三，邮箱是zhang@example.com",
+      "message_type": "user_info",
+      "task_id": "unique_task_id"
+    }
   }
   ```
+- **通用性设计**: 
+  - **避免表单特化**: 不要因为题目验收标准是表单就专门针对表单设计通信协议
+  - **泛化交互模式**: 设计为通用的Agent对话模式，支持各种任务场景
+  - **自然对话流**: 两个Agent之间的交互应该像两个人自然对话一样
 
-#### 2.3.2 上下文融合
-- **Phone Agent上下文**: `用户输入 + [FROM_COMPUTER_AGENT] 电脑消息`
-  - 例如: "我的全名是张三... [FROM_COMPUTER_AGENT] 已找到名字输入框并填写'张'"
-- **Computer Agent上下文**: `屏幕状态 + [FROM_PHONE_AGENT] 电话消息`
-  - 例如: "[截图数据] + [FROM_PHONE_AGENT] 用户表示他的邮箱是zhang@example.com"
+#### 2.3.2 消息处理流程
+- **Phone Agent收到用户输入** → **工具调用发送给Computer Agent** → **Computer Agent使用LLM分析** → **Computer Agent执行操作** → **工具调用反馈给Phone Agent**
+- **LLM驱动的信息提取**: 
+  - Computer Agent收到用户回答后，使用LLM从message中智能提取表单信息
+  - 完全依赖LLM的理解能力，不使用任何硬编码的字符串匹配
+  - LLM可以理解各种自然语言表达方式
 
 ## 3. 实现计划
 
@@ -153,49 +165,46 @@ class PhoneAgent:
 ```python
 class ComputerAgent:
   # 核心组件
-  - browser: 基于browser-use的浏览器自动化控制
-  - vision_llm: 多模态大语言模型
-  - message_queue: A2A消息队列接口
+  - computer_use_client: Anthropic Computer Use客户端或Browser-Use客户端
+  - llm_analyzer: 智能LLM分析器，用于理解用户输入和生成操作指令
+  - message_tools: 工具调用接口，支持send_message_to_phone_agent
   - state_manager: 操作状态管理器
   
   # 核心方法
-  + initialize(url): 初始化浏览器并访问指定URL
-  + captureScreenshot(): 捕获当前页面截图
-  + extractPageContent(): 提取当前页面DOM和文本内容
-  + analyzePageContent(content, screenshot): 分析页面内容并识别可操作元素
-  + takeBrowserAction(action): 执行浏览器操作(点击、输入等)
-    - findElement(selector): 查找页面元素
-    - clickElement(element): 点击元素
-    - inputText(element, text): 在元素中输入文本
-    - scrollPage(direction): 滚动页面
-  + verifyAction(action, expected_result): 验证操作结果
-  + handlePhoneMessage(message): 处理来自Phone Agent的消息
-  + sendMessageToPhone(message): 发送消息到Phone Agent
-  + reportStatus(): 报告当前状态和操作进度
+  + initialize(framework_type): 初始化选定的浏览器自动化框架
+  + process_user_message(message): 使用LLM分析用户消息并生成操作计划
+    - analyze_user_intent(): 让LLM理解用户意图
+    - extract_form_data_with_llm(): 使用LLM从自然语言中提取表单数据
+    - generate_browser_operations(): 基于LLM分析生成浏览器操作序列
+  + execute_browser_operations(operations): 使用框架执行浏览器操作
+    - 禁止硬编码选择器匹配
+    - 全部依赖框架的智能识别能力
+  + send_message_to_phone_agent(message): 工具调用发送消息给Phone Agent
+  + verify_operations_with_llm(): 使用LLM验证操作结果
 ```
 
 ### 3.3 实现步骤
-1. **设置基础环境和依赖**
-   - 配置Siliconflow API密钥和访问凭证
-   - 安装browser-use或Playwright
-   - 设置A2A消息通信系统
-2. **实现Phone Agent核心功能**
-   - 实现VAD和Siliconflow ASR集成
-   - 开发基于doubao-seed-1-6-flash-250615和doubao-seed-1-6-thinking-250615的快慢思考双路径
-   - 完成边听边想功能
-   - 开发Siliconflow TTS响应生成
-3. **实现Computer Agent核心功能**
-   - 集成browser-use框架
-   - 实现页面分析和操作功能（使用doubao-seed-1-6-thinking-250615）
-   - 开发元素定位和交互能力
-4. **设计并实现A2A通信机制**
-   - 定义消息格式和通信协议
-   - 实现消息队列和处理逻辑
-   - 开发上下文融合机制
+1. **选择和集成浏览器自动化框架**
+   - 优先集成Anthropic Computer Use框架
+   - 备选方案集成Browser-Use框架
+   - 完全移除现有的自研Playwright封装
+2. **实现Phone Agent的工具调用能力**
+   - 实现send_message_to_computer_agent工具
+   - 修改思考引擎输出格式支持工具调用
+   - 保持现有的VAD、ASR、TTS功能不变
+3. **重构Computer Agent为LLM驱动模式**
+   - 移除所有硬编码的字符串匹配逻辑
+   - 实现LLM驱动的用户输入分析
+   - 集成选定的浏览器自动化框架
+   - 实现send_message_to_phone_agent工具
+4. **实现工具调用通信机制**
+   - 建立基于工具调用的Agent间通信协议
+   - 确保消息的可靠传递和处理
+   - 实现异常处理和重试机制
 5. **集成测试与优化**
-   - 单元测试各组件功能
-   - 进行端到端测试
-   - 优化性能和响应速度
+   - 端到端测试Agent间协作
+   - 验证LLM驱动的表单填写能力
+   - 优化响应速度和准确性
 
 ## 4. 技术选型
 
@@ -208,21 +217,30 @@ class ComputerAgent:
 - **TTS**: Siliconflow fishaudio/fish-speech-1.5模型 (自然语音合成)
 
 ### 4.2 Computer Agent
-- **浏览器自动化**: browser-use或Playwright
-  - browser-use提供更高级的浏览器控制能力和易用API
-  - 支持截图、DOM提取和元素交互
-- **多模态LLM**: doubao-seed-1-6-thinking-250615 (Siliconflow平台，支持图像理解)
-- **元素定位策略**: 
-  - XPath和CSS选择器定位
-  - 视觉定位(基于截图和坐标)
+- **浏览器自动化框架**:
+  - **主选**: [Anthropic Computer Use](https://github.com/anthropics/anthropic-computer-use)
+    - Anthropic官方开发，专为AI Agent设计
+    - 支持视觉识别和自然语言指令
+    - 与Claude模型深度集成
+  - **备选**: [Browser-Use](https://github.com/BrowserUse/browser-use)
+    - 专业的浏览器自动化框架
+    - 支持多种LLM集成
+    - 提供丰富的浏览器操作API
+- **LLM分析器**: doubao-seed-1-6-thinking-250615 (Siliconflow平台)
+  - 用于分析用户输入和理解表单结构
+  - 生成智能的浏览器操作指令
+  - **完全禁止硬编码**: 不使用任何字符串匹配、正则表达式等硬编码方式
+- **工具调用系统**: 
+  - 实现标准化的send_message_to_phone_agent工具
+  - 支持结构化的消息传递和状态同步
 
 ### 4.3 通信层
-- **消息队列**: 基于Redis的异步消息系统
-  - 支持发布/订阅模式
-  - 提供消息持久化和重试机制
-- **Web服务器**: FastAPI作为系统后端
-  - 提供RESTful API接口
-  - 支持WebSocket进行实时通信
+- **工具调用系统**: 基于LLM工具调用的Agent间通信
+  - **send_message_to_computer_agent**: Phone Agent调用此工具发送消息
+  - **send_message_to_phone_agent**: Computer Agent调用此工具发送消息
+  - **消息格式标准化**: 使用JSON格式确保消息的结构化传递
+- **异步处理**: 支持非阻塞的消息处理和响应
+- **错误处理**: 内置重试机制和异常处理逻辑
 
 ### 4.4 Siliconflow API配置
 

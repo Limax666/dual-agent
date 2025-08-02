@@ -26,7 +26,11 @@ from dual_agent.phone_agent.vad import SileroVAD
 from dual_agent.phone_agent.asr import StreamingASR, ASRProvider
 from dual_agent.phone_agent.thinking_engine import MixedThinkingEngine, LLMProvider
 from dual_agent.phone_agent.tts import TTSEngine, TTSProvider
-from dual_agent.common.messaging import message_queue, A2AMessage, MessageType, MessageSource
+from dual_agent.common.messaging import message_queue
+from dual_agent.common.tool_calling import (
+    ToolCallHandler, MessageType, register_agent_handler,
+    send_message_to_computer_agent, ToolMessage, PHONE_AGENT_TOOLS
+)
 
 class PhoneAgentState(Enum):
     IDLE = auto()
@@ -65,7 +69,13 @@ class PhoneAgent:
         self.logs = []
         
         self.log(f"Initializing VAD with threshold: {config.vad_threshold}")
-        self.vad = SileroVAD(threshold=config.vad_threshold, sampling_rate=config.vad_sampling_rate)
+        self.vad = SileroVAD(
+            threshold=config.vad_threshold, 
+            sampling_rate=config.vad_sampling_rate,
+            noise_threshold=0.03,  # 提高噪声阈值，减少误检
+            min_speech_duration_ms=300,  # 增加最小语音持续时间
+            min_silence_duration_ms=600   # 增加最小静默时间
+        )
         
         self.log(f"Initializing ASR. Provider: {config.asr_provider.name}, Model: {config.asr_model_name}")
         self.asr = StreamingASR(provider=config.asr_provider, model_size_or_name=config.asr_model_name, language=config.language)
@@ -81,6 +91,17 @@ class PhoneAgent:
         self.log(f"Initializing TTS with provider: {config.tts_provider.name}")
         self.tts = TTSEngine(provider=config.tts_provider, voice=config.tts_voice, debug=config.debug)
         
+        # 初始化工具调用处理器
+        self.tool_handler = ToolCallHandler("phone_agent")
+        self.tool_handler.register_handler(MessageType.TASK_RESULT, self._handle_computer_response)
+        self.tool_handler.register_handler(MessageType.SYSTEM_STATUS, self._handle_computer_status)
+        self.tool_handler.register_handler(MessageType.ERROR, self._handle_computer_error)
+        self.tool_handler.register_handler(MessageType.PAGE_ANALYSIS, self._handle_page_analysis)
+        
+        # 注册全局处理器
+        register_agent_handler("phone_agent", self.tool_handler)
+        
+        # 初始化消息队列
         self.message_queue = message_queue
         
         # 添加控制属性
@@ -105,6 +126,9 @@ class PhoneAgent:
         self.stop_event.clear()
         
         try:
+            # 启动工具调用处理器
+            tool_task = asyncio.create_task(self.tool_handler.start_listening())
+            
             # 首先打招呼
             print("👋 Phone Agent开始问候...")
             await self._speak_greeting()
@@ -118,11 +142,204 @@ class PhoneAgent:
             print(f"❌ Phone Agent出错: {e}")
         finally:
             self.is_running = False
+            self.tool_handler.stop()
             self.log("Phone Agent stopped")
             print("🛑 Phone Agent已停止")
 
+    async def _handle_computer_response(self, message: ToolMessage):
+        """处理来自Computer Agent的响应消息"""
+        try:
+            content = message.content
+            text = content.get("text", "")
+            additional_data = content.get("additional_data", {})
+            
+            if text:
+                print(f"📥 收到Computer Agent回应: {text}")
+                
+                # 使用LLM将技术性消息转换为用户友好的消息
+                user_friendly_text = await self._convert_to_user_friendly_message(text, additional_data)
+                
+                # 向用户播报处理后的消息
+                await self._speak_response(user_friendly_text)
+                
+                # 更新页面信息
+                if additional_data:
+                    page_info = additional_data.get("page_info")
+                    if page_info:
+                        self.current_page_info = page_info
+                        self.current_form_fields = page_info.get("form_fields", [])
+                        print(f"🌐 更新页面信息: {page_info.get('title', '未知页面')}")
+                        
+        except Exception as e:
+            self.log(f"Error handling computer response: {e}")
+            print(f"❌ 处理Computer Agent响应时出错: {e}")
+    
+    async def _convert_to_user_friendly_message(self, technical_message: str, additional_data: dict) -> str:
+        """使用LLM将技术性消息转换为用户友好的消息"""
+        try:
+            # 构建用于消息转换的提示
+            conversion_prompt = f"""
+请将以下技术性消息转换为用户友好的自然语言回应：
+
+技术消息：{technical_message}
+附加信息：{additional_data}
+
+转换规则：
+1. 不要向用户播报技术性的URL地址
+2. 如果是网页打开成功，只说"网页已打开"或类似自然表达
+3. 如果有页面标题，可以提及标题
+4. 移除所有技术性术语和状态信息
+5. 用自然、简洁的中文表达
+6. 如果消息为空或无意义，返回"操作完成"
+
+只返回转换后的用户友好消息，不要其他内容：
+"""
+            
+            # 使用思考引擎进行消息转换
+            converted_message, _ = await self.thinking_engine._fast_think_simple(conversion_prompt)
+            
+            # 如果转换失败或为空，使用默认消息
+            if not converted_message or len(converted_message.strip()) < 2:
+                return "操作完成"
+                
+            return converted_message.strip()
+            
+        except Exception as e:
+            self.log(f"LLM消息转换失败: {e}")
+            # 降级处理：简单移除URL
+            import re
+            clean_message = re.sub(r'https?://[^\s]+', '', technical_message).strip()
+            return clean_message if clean_message else "操作完成"
+    
+    async def _handle_computer_status(self, message: ToolMessage):
+        """处理来自Computer Agent的状态消息"""
+        try:
+            content = message.content
+            text = content.get("text", "")
+            
+            if text:
+                print(f"📊 Computer Agent状态: {text}")
+                # 可以选择性地播报重要状态
+                if "错误" in text or "失败" in text:
+                    await self._speak_response(f"遇到问题：{text}")
+                    
+        except Exception as e:
+            self.log(f"Error handling computer status: {e}")
+    
+    async def _handle_computer_error(self, message: ToolMessage):
+        """处理来自Computer Agent的错误消息"""
+        try:
+            content = message.content
+            text = content.get("text", "")
+            
+            if text:
+                print(f"❌ Computer Agent错误: {text}")
+                await self._speak_response(f"抱歉，出现了问题：{text}")
+                
+        except Exception as e:
+            self.log(f"Error handling computer error: {e}")
+    
+    async def _handle_page_analysis(self, message: ToolMessage):
+        """处理来自Computer Agent的页面分析消息（支持各种网页类型）"""
+        try:
+            content = message.content
+            text = content.get("text", "")
+            additional_data = content.get("additional_data", {})
+            
+            if text:
+                print(f"🌐 页面分析消息: {text}")
+                
+                # 从additional_data中提取通用页面信息
+                url = additional_data.get("url", "")
+                page_type = additional_data.get("page_type", "unknown")
+                page_purpose = additional_data.get("page_purpose", "")
+                business_context = additional_data.get("business_context", "")
+                available_actions = additional_data.get("available_actions", [])
+                input_fields = additional_data.get("input_fields", [])
+                user_workflow = additional_data.get("user_workflow", "")
+                interaction_guidance = additional_data.get("interaction_guidance", "")
+                ready_for_input = additional_data.get("ready_for_user_input", False)
+                
+                # 更新当前页面信息 - 使用新的数据结构
+                if url:
+                    self.current_page_info = {
+                        "url": url,
+                        "page_type": page_type,
+                        "page_purpose": page_purpose,
+                        "business_context": business_context,
+                        "available_actions": available_actions,
+                        "input_fields": input_fields,
+                        "user_workflow": user_workflow,
+                        "interaction_guidance": interaction_guidance,
+                        "ready_for_input": ready_for_input
+                    }
+                    
+                    # 更新表单字段信息（兼容原有逻辑）
+                    self.current_form_fields = input_fields
+                    
+                    print(f"✅ 页面信息已更新: {url} (类型: {page_type})")
+                    
+                    # 将页面信息添加到思考引擎上下文
+                    if business_context:
+                        context_message = f"[页面上下文] Computer Agent已分析页面: {business_context}。页面类型: {page_type}。{interaction_guidance}"
+                    else:
+                        context_message = f"[页面上下文] Computer Agent已分析页面: {page_purpose}。页面类型: {page_type}。{interaction_guidance}"
+                    
+                    if available_actions:
+                        actions_text = "、".join(available_actions[:3])  # 最多显示3个主要操作
+                        context_message += f" 主要操作: {actions_text}"
+                    
+                    if input_fields:
+                        field_names = [field.get("field_name", "") for field in input_fields[:5]]
+                        field_names = [name for name in field_names if name]
+                        if field_names:
+                            fields_text = "、".join(field_names)
+                            context_message += f" 可填字段: {fields_text}"
+                    
+                    self.thinking_engine.add_message("system", context_message)
+                    print(f"🔄 已更新AI上下文: {context_message}")
+                
+                # 向用户播报页面已准备好
+                if ready_for_input and text:
+                    # 转换为用户友好的消息
+                    user_friendly_text = await self._convert_to_user_friendly_message(text, additional_data)
+                    await self._speak_response(user_friendly_text)
+                else:
+                    # 转换为用户友好的消息
+                    user_friendly_text = await self._convert_to_user_friendly_message(text, additional_data)
+                    await self._speak_response(user_friendly_text)
+                    
+        except Exception as e:
+            self.log(f"Error handling page analysis: {e}")
+            print(f"❌ 处理页面分析消息时出错: {e}")
+    
+    async def _send_to_computer_agent(self, user_text: str, task_id: Optional[str] = None):
+        """发送消息给Computer Agent"""
+        try:
+            print(f"📤 发送给Computer Agent: {user_text}")
+            
+            # 使用工具调用发送消息
+            result = await send_message_to_computer_agent(
+                message=user_text,
+                message_type="user_input",
+                task_id=task_id,
+                additional_data={
+                    "session_id": self.session_id,
+                    "timestamp": time.time()
+                }
+            )
+            
+            if result.get("success"):
+                print(f"✅ 消息发送成功: {result.get('message_id')}")
+            else:
+                print(f"❌ 消息发送失败: {result.get('error')}")
+                
+        except Exception as e:
+            self.log(f"Error sending message to computer agent: {e}")
+            print(f"❌ 发送消息给Computer Agent时出错: {e}")
+    
     async def _speak_greeting(self):
-        """播放开场问候语"""
+        """播放开场问候语（完全依赖Computer Agent的实时页面信息）"""
         # 等待一下，让Computer Agent有时间发送页面信息
         await asyncio.sleep(1)
         
@@ -131,15 +348,20 @@ class PhoneAgent:
         
         # 根据是否有页面信息生成不同的问候语
         if self.current_page_info:
-            page_title = self.current_page_info['title']
-            forms_count = self.current_page_info['forms_count']
-            if forms_count > 0:
-                greeting = f"您好！我是您的AI助手。我看到Computer Agent已经为您打开了'{page_title}'页面，该页面有{forms_count}个表单可以填写。请告诉我您需要填写什么信息，比如姓名、电话、邮箱等。"
+            page_analysis = self.current_page_info
+            page_type = page_analysis.get('page_type', 'unknown')
+            business_context = page_analysis.get('business_context', '')
+            interaction_guidance = page_analysis.get('interaction_guidance', '')
+            
+            if business_context and interaction_guidance:
+                greeting = f"您好！我是您的AI助手。我看到Computer Agent已经为您打开了{business_context}页面。{interaction_guidance}"
+            elif business_context:
+                greeting = f"您好！我是您的AI助手。我看到Computer Agent已经为您打开了{business_context}页面。请告诉我您想要做什么。"
             else:
-                greeting = f"您好！我是您的AI助手。我看到Computer Agent已经为您打开了'{page_title}'页面。请告诉我您需要做什么操作。"
+                greeting = f"您好！我是您的AI助手。页面已打开，请告诉我您想要做什么操作。"
         else:
-            # 默认问候语（当没有页面信息时）
-            greeting = "您好！我是您的AI助手，我可以帮助您填写网页表单。请告诉我您需要填写什么信息，或者说'开始填表'来开始。"
+            # 默认问候语（当没有页面信息时） - 不预设任何业务场景
+            greeting = "您好！我是您的AI助手。我正在等待Computer Agent分析当前页面，请稍等片刻，然后告诉我您想要做什么。"
         
         self.log(f"Greeting: {greeting}")
         print(f"🤖 AI说: {greeting}")

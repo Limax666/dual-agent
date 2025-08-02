@@ -22,4 +22,13 @@ typing_extensions==4.12.2
 urllib3==2.2.2
 volcengine
 aiohttp==3.9.1
-pygame==2.6.1 
+pygame==2.6.1
+# Browser automation framework
+browser-use==0.5.7
+playwright>=1.40.0
+anthropic>=0.7.0
+python-dotenv>=1.0.0
+MainContentExtractor==0.0.4
+# Selenium-Screenshot>=1.0.0
+selenium>=4.0.0
+webdriver-manager>=4.0.0 
