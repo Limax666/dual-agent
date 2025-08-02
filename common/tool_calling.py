@@ -21,6 +21,7 @@ class MessageType(Enum):
     ERROR = "error"                     # 错误消息
     FORM_DATA = "form_data"            # 表单数据消息
     PAGE_ANALYSIS = "page_analysis"     # 页面分析消息
+    TASK_COMPLETION = "task_completion" # 任务完成通知消息
 
 
 @dataclass
@@ -112,6 +113,7 @@ def register_agent_handler(agent_name: str, handler: ToolCallHandler):
     """注册Agent处理器"""
     _agent_handlers[agent_name] = handler
     print(f"✅ 注册Agent处理器: {agent_name}")
+    print(f"   当前已注册的处理器: {list(_agent_handlers.keys())}")
 
 
 def get_agent_handler(agent_name: str) -> Optional[ToolCallHandler]:
@@ -139,10 +141,17 @@ async def send_message_to_computer_agent(
         发送结果
     """
     try:
-        # 获取Phone Agent的处理器
+        # 获取Phone Agent的处理器，带重试机制
         phone_handler = get_agent_handler("phone_agent")
         if not phone_handler:
-            return {"success": False, "error": "Phone Agent处理器未注册"}
+            # 等待一小段时间再重试（处理异步注册时机问题）
+            await asyncio.sleep(0.1)
+            phone_handler = get_agent_handler("phone_agent")
+            
+        if not phone_handler:
+            # 调试信息：显示当前注册的处理器
+            registered_agents = list(_agent_handlers.keys())
+            return {"success": False, "error": f"Phone Agent处理器未注册，当前已注册: {registered_agents}"}
             
         # 构建消息内容
         content = {

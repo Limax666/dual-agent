@@ -97,6 +97,10 @@ class IntelligentComputerAgent:
         # 用户表单数据缓存
         self.user_form_data = {}
         
+        # 表单填写状态管理 - 防止重复执行
+        self.current_filling_task = None
+        self.last_filled_fields = {}
+        
         self.log(f"IntelligentComputerAgent初始化完成")
     
     def _initialize_browser_agent(self):
@@ -219,8 +223,8 @@ class IntelligentComputerAgent:
         self.log("启动IntelligentComputerAgent")
         
         try:
-            # 启动工具调用处理器
-            tool_task = asyncio.create_task(self.tool_handler.start_listening())
+            # 启动工具调用处理器 - 不等待，让它在后台运行
+            self.tool_task = asyncio.create_task(self.tool_handler.start_listening())
             
             self.log("IntelligentComputerAgent启动完成，等待任务...")
             
@@ -237,64 +241,125 @@ class IntelligentComputerAgent:
             # 如果设置了目标URL，自动导航
             if self.target_url:
                 self.log(f"检测到目标URL，开始自动导航: {self.target_url}")
-                await asyncio.sleep(2)  # 稍等确保Phone Agent已准备好
+                await asyncio.sleep(3)  # 稍等确保Phone Agent已准备好
                 await self._auto_navigate_to_target_url()
             
-            # 保持运行
-            await tool_task
+            # 不阻塞初始化过程，让工具调用处理器在后台运行
+            self.log("✅ Computer Agent初始化完成，工具调用处理器已在后台运行")
             
         except Exception as e:
             self.log(f"启动失败: {e}")
             self.state = ComputerAgentState.ERROR
     
     async def _auto_navigate_to_target_url(self):
-        """自动导航到目标URL并分析页面（使用browser-use官方方式）"""
+        """自动导航到目标URL并分析页面（使用async_playwright保持浏览器会话活跃）"""
         try:
             if not self.target_url:
                 return
             
             self.log(f"开始导航到目标URL: {self.target_url}")
             
-            # 按照官方示例创建browser-use agent
+            # 使用async_playwright创建持久浏览器会话
+            from browser_use.browser.types import async_playwright
+            from browser_use.browser import BrowserSession
             from browser_use import Agent
             
-            # 创建导航任务 - 简化任务描述，确保浏览器保持打开
-            task = f"Navigate to {self.target_url} and analyze the form on the page"
-            
-            self.browser_agent = Agent(
-                task=task,
-                llm=self.llm_client,
-                headless=self.config.headless,  # 传递headless配置
+            # 创建持久的playwright浏览器会话
+            self.playwright = await async_playwright().start()
+            self.browser = await self.playwright.chromium.launch(
+                headless=self.config.headless,
             )
             
-            self.log("创建browser-use agent并执行导航+分析任务...")
-            print(f"🌐 正在导航到: {self.target_url}")
+            self.browser_context = await self.browser.new_context(
+                viewport={'width': 1502, 'height': 853},
+                ignore_https_errors=True,
+            )
             
-            # 执行导航任务，使用正确的browser-use执行方式
+            # 创建第一个页面用于导航和后续操作
+            self.current_page = await self.browser_context.new_page()
+            
+            # 创建导航+分析任务
+            task = f"""Navigate to {self.target_url} and analyze the page content. Extract detailed information about all form fields including their names, types, and structure. 
+
+IMPORTANT INSTRUCTIONS:
+1. Do NOT fill in any form fields or submit any forms
+2. After completing the analysis, call done() to finish this specific task
+3. The browser session will remain active for future form filling operations
+
+The goal is to analyze the page structure and prepare for subsequent form filling operations."""
+            
+            # 创建BrowserSession时指定使用现有页面
+            browser_session = BrowserSession(
+                browser_context=self.browser_context,
+                page=self.current_page  # 指定使用创建的页面
+            )
+            
+            self.browser_agent = Agent(
+                browser_session=browser_session,
+                task=task,
+                llm=self.llm_client,
+                max_actions_per_step=3,
+                generate_gif=False,
+                save_recording_path=None,
+            )
+            
+            self.log("创建持久playwright浏览器会话并执行导航+分析任务...")
+            print(f"🌐 正在导航到: {self.target_url}（使用playwright保持会话活跃）")
+            
+            # 执行导航任务，playwright会话将保持活跃
             try:
-                # 让browser-use执行导航任务
-                result = await asyncio.wait_for(self.browser_agent.run(), timeout=60.0)
+                # 执行导航和分析任务
+                result = await asyncio.wait_for(self.browser_agent.run(), timeout=90.0)
                 self.log(f"✅ 导航任务执行完成: {result}")
+                
+                # playwright浏览器会话会自动保持活跃，不需要额外的保持任务
+                
+                self.log("🔄 浏览器会话保持活跃，准备接收表单填写任务")
                 
                 # 设置页面准备就绪
                 self.page_ready = True
                 
-                # 发送导航成功消息（如果有phone agent的话）
+                # 基于browser-use的实际分析结果发送消息给Phone Agent
                 try:
+                    self.log("📊 开始解析browser-use分析结果...")
+                    
+                    # 解析browser-use的分析结果
+                    page_info = await self._parse_browser_use_result(str(result))
+                    self.log(f"📊 页面分析结果: {page_info}")
+                    
+                    # 构建用户友好的描述
+                    description = self._build_page_description(page_info)
+                    self.log(f"📝 构建的页面描述: {description}")
+                    
+                    # 发送消息给Phone Agent
+                    message_text = f"我已经打开了{self.target_url}页面。{description}"
+                    self.log(f"📤 准备发送给Phone Agent的消息: {message_text}")
+                    
                     await self._send_to_phone_agent(
-                        f"✅ 已成功导航到 {self.target_url}，浏览器会话保持活跃，可以开始填写表单。",
+                        message_text,
                         message_type="page_analysis",
                         additional_data={
                             "url": self.target_url,
-                            "page_type": "form",
-                            "page_purpose": "表单填写",
+                            "page_type": page_info.get('page_type', 'form'),
+                            "page_purpose": page_info.get('purpose', '表单填写'),
                             "ready_for_user_input": True,
-                            "browser_session_active": True
+                            "browser_session_active": False,  # browser-use已完成，浏览器可能关闭
+                            "detected_fields": page_info.get('form_fields', []),
+                            "form_analysis": page_info.get('analysis', ''),
+                            "task_completed": True  # 重要：标记任务已完成
                         }
                     )
-                    self.log("✅ 导航分析完成并发送给Phone Agent")
+                    self.log("✅ 页面分析结果已发送给Phone Agent")
+                    
+                    # 发送任务完成通知
+                    await self._notify_task_completion("page_navigation", True, "页面导航和分析已完成")
                 except Exception as send_error:
-                    self.log(f"发送导航结果失败（可能没有Phone Agent）: {send_error}")
+                    self.log(f"❌ 发送导航结果失败: {send_error}")
+                    import traceback
+                    self.log(f"错误详情: {traceback.format_exc()}")
+                    
+                    # 即使失败也通知任务完成
+                    await self._notify_task_completion("page_navigation", False, f"页面分析失败: {send_error}")
                 
             except asyncio.TimeoutError:
                 self.log("导航超时，但尝试继续")
@@ -324,6 +389,116 @@ class IntelligentComputerAgent:
                 )
             except Exception as send_error:
                 self.log(f"发送错误消息也失败: {send_error}")
+    
+    def _build_page_description(self, page_info: dict) -> str:
+        """基于页面信息构建用户友好的描述"""
+        try:
+            page_type = page_info.get('page_type', 'unknown')
+            form_fields = page_info.get('form_fields', [])
+            analysis = page_info.get('analysis', '')
+            
+            if page_type == 'form' and form_fields:
+                # 构建表单字段的描述
+                field_descriptions = []
+                for field in form_fields[:5]:  # 只显示前5个字段
+                    field_name = field.get('name', field.get('id', ''))
+                    field_type = field.get('type', '')
+                    if field_name:
+                        field_descriptions.append(f"{field_name}({field_type})")
+                
+                if field_descriptions:
+                    description = f"这是一个表单页面，包含以下字段：{', '.join(field_descriptions)}。您可以告诉我需要填写的信息。"
+                else:
+                    description = "这是一个表单页面，已准备好填写。请告诉我您需要填写的信息。"
+            else:
+                description = f"页面已成功打开，{analysis if analysis else '您可以告诉我需要进行什么操作。'}"
+            
+            return description
+            
+        except Exception as e:
+            self.log(f"构建页面描述失败: {e}")
+            return "页面已打开，您可以告诉我需要进行什么操作。"
+    
+    async def _analyze_current_page(self) -> dict:
+        """分析当前页面内容，提取有用信息"""
+        try:
+            if not self.llm_client:
+                return {
+                    "description": "页面已准备就绪，您可以告诉我需要填写什么信息。",
+                    "page_type": "form",
+                    "purpose": "表单填写",
+                    "fields": []
+                }
+            
+            # 使用LLM分析URL和页面上下文，提供智能描述
+            url_analysis_prompt = f"""
+分析这个URL: {self.target_url}
+
+请根据URL判断这个页面的用途，并生成用户友好的描述。
+
+常见的页面类型：
+- 表单页面（注册、联系、订单等）
+- 搜索页面
+- 购物页面
+- 登录页面
+
+请以JSON格式回复：
+{{
+    "page_type": "form|search|shopping|login|other",
+    "purpose": "简短描述页面用途",
+    "description": "向用户解释这个页面的功能，引导用户提供相应信息",
+    "fields": ["可能需要的字段1", "可能需要的字段2"]
+}}
+"""
+            
+            try:
+                if hasattr(self.llm_client, 'chat') and hasattr(self.llm_client.chat, 'completions'):
+                    response = await self.llm_client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[
+                            {"role": "system", "content": "You are a web page analyzer."},
+                            {"role": "user", "content": url_analysis_prompt}
+                        ],
+                        temperature=0.1,
+                        max_tokens=300
+                    )
+                    result_text = response.choices[0].message.content.strip()
+                else:
+                    result_text = await self.llm_client.ainvoke([
+                        {"role": "system", "content": "You are a web page analyzer."},
+                        {"role": "user", "content": url_analysis_prompt}
+                    ])
+                    if isinstance(result_text, dict) and 'content' in result_text:
+                        result_text = result_text['content']
+                    result_text = str(result_text).strip()
+                
+                # 解析LLM响应
+                if result_text.startswith('```json'):
+                    result_text = result_text.replace('```json', '').replace('```', '').strip()
+                elif result_text.startswith('```'):
+                    result_text = result_text.replace('```', '').strip()
+                
+                analysis = json.loads(result_text)
+                self.log(f"页面分析结果: {analysis}")
+                return analysis
+                
+            except Exception as llm_error:
+                self.log(f"LLM页面分析失败: {llm_error}")
+                return {
+                    "description": "页面已准备就绪，您可以告诉我需要填写什么信息。",
+                    "page_type": "form",
+                    "purpose": "表单填写",
+                    "fields": []
+                }
+                
+        except Exception as e:
+            self.log(f"页面分析失败: {e}")
+            return {
+                "description": "页面已准备就绪，您可以告诉我需要填写什么信息。",
+                "page_type": "form", 
+                "purpose": "表单填写",
+                "fields": []
+            }
     
     async def _parse_browser_use_result(self, browser_result: str) -> dict:
         """完全使用LLM解析browser-use结果，无任何硬编码"""
@@ -442,23 +617,12 @@ Browser-use完整执行结果:
                 
                 user_message = f"我已帮您打开了{business_context}。{interaction_guidance}"
                 
-                # 通过工具调用发送页面分析结果给Phone Agent
-                analysis_data = {
-                    "url": self.target_url,
-                    "page_type": parsed_data.get("page_type", "unknown"),
-                    "page_purpose": parsed_data.get("page_title", "网页操作"),
-                    "business_context": business_context,
-                    "available_actions": parsed_data.get("available_actions", []),
-                    "input_fields": input_fields,
-                    "user_workflow": parsed_data.get("user_workflow", ""),
-                    "interaction_guidance": interaction_guidance,
-                    "ready_for_user_input": True,
-                    "llm_analysis_complete": True
-                }
-                
+                # 构建返回数据
                 return {
-                    "message": user_message,
-                    "data": analysis_data
+                    "page_type": parsed_data.get("page_type", "unknown"),
+                    "purpose": parsed_data.get("page_title", "网页操作"),
+                    "analysis": user_message,
+                    "form_fields": input_fields
                 }
                 
             except json.JSONDecodeError as json_error:
@@ -504,18 +668,10 @@ Browser-use完整执行结果:
     async def _get_fallback_page_analysis(self) -> dict:
         """获取备选页面分析数据"""
         return {
-            "message": f"已打开页面 {self.target_url}，请告诉我您要填写的信息。",
-            "data": {
-                "url": self.target_url,
-                "page_type": "form",
-                "page_purpose": "表单填写",
-                "business_context": "网页表单",
-                "available_actions": ["填写表单信息"],
-                "input_fields": [],
-                "user_workflow": "请提供您要填写的信息",
-                "interaction_guidance": "您可以说出需要填写的具体信息",
-                "ready_for_user_input": True
-            }
+            "page_type": "form",
+            "purpose": "表单填写",
+            "analysis": f"已打开页面 {self.target_url}，请告诉我您要填写的信息。",
+            "form_fields": []
         }
     
     async def _analyze_current_page_directly(self):
@@ -819,7 +975,13 @@ Browser-use分析结果:
         try:
             self.state = ComputerAgentState.OPERATING
             
-            if not BROWSER_USE_AVAILABLE or not self.browser_agent:
+            # 检查是否是关闭网页的请求
+            if any(keyword in user_text.lower() for keyword in ["关闭网页", "关闭浏览器", "关闭页面", "close browser", "close page"]):
+                await self._handle_close_browser_request()
+                self.state = ComputerAgentState.IDLE
+                return
+            
+            if not BROWSER_USE_AVAILABLE:
                 await self._fallback_response(user_text)
                 return
             
@@ -838,6 +1000,60 @@ Browser-use分析结果:
         except Exception as e:
             self.log(f"处理用户输入失败: {e}")
             await self._fallback_response(user_text)
+    
+    async def _handle_close_browser_request(self):
+        """处理用户关闭浏览器的请求（关闭playwright会话）"""
+        try:
+            self.log("用户请求关闭浏览器")
+            
+            # 关闭playwright浏览器会话
+            if hasattr(self, 'browser_context') and self.browser_context:
+                try:
+                    await self.browser_context.close()
+                    self.log("✅ 浏览器上下文已关闭")
+                except Exception as e:
+                    self.log(f"关闭浏览器上下文失败: {e}")
+            
+            if hasattr(self, 'browser') and self.browser:
+                try:
+                    await self.browser.close()
+                    self.log("✅ 浏览器已关闭")
+                except Exception as e:
+                    self.log(f"关闭浏览器失败: {e}")
+            
+            if hasattr(self, 'playwright') and self.playwright:
+                try:
+                    await self.playwright.stop()
+                    self.log("✅ Playwright已停止")
+                except Exception as e:
+                    self.log(f"停止playwright失败: {e}")
+            
+            # 清理状态
+            self.browser_agent = None
+            self.browser_context = None
+            self.browser = None
+            self.playwright = None
+            self.last_filled_fields = {}
+            self.current_filling_task = None
+            
+            await self._send_to_phone_agent(
+                "好的，已关闭网页。",
+                message_type="task_result",
+                additional_data={"browser_active": False, "action": "browser_closed"}
+            )
+                
+        except Exception as e:
+            self.log(f"处理关闭浏览器请求失败: {e}")
+            # 确保状态清理
+            self.browser_agent = None
+            self.browser_context = None
+            self.browser = None
+            self.playwright = None
+            await self._send_to_phone_agent(
+                "网页已关闭。",
+                message_type="task_result",
+                additional_data={"browser_active": False, "action": "browser_closed"}
+            )
     
     async def _extract_form_data_from_text(self, user_text: str) -> dict:
         """从用户文本中提取表单数据 - 严格按照设计文档，完全依赖LLM"""
@@ -1087,82 +1303,333 @@ Browser-use分析结果:
             if actual_form_fields:
                 self.log(f"🚀 开始实际的browser-use表单填写: {actual_form_fields}")
                 
-                # 强制执行实际的browser-use表单填写
-                success = await self._execute_actual_form_filling(actual_form_fields)
+                # 立即发送开始处理的通知
+                filled_info = [f"{k}: {v}" for k, v in actual_form_fields.items()]
+                start_message = f"正在填写表单信息: {', '.join(filled_info)}..."
+                await self._send_to_phone_agent(
+                    start_message,
+                    message_type="task_result",
+                    additional_data={"status": "filling_started", "filled_fields": actual_form_fields}
+                )
                 
-                if success:
-                    filled_info = [f"{k}: {v}" for k, v in actual_form_fields.items()]
-                    await self._send_to_phone_agent(
-                        f"✅ 已成功在网页中填写: {', '.join(filled_info)}。",
-                        message_type="task_result",
-                        additional_data={"filled_fields": actual_form_fields, "status": "browser_filled"}
-                    )
-                else:
-                    # 如果browser-use填写失败，至少记录用户信息
-                    filled_info = [f"{k}: {v}" for k, v in actual_form_fields.items()]
-                    await self._send_to_phone_agent(
-                        f"⚠️ 网页填写遇到技术问题，但已记录您的信息: {', '.join(filled_info)}。",
-                        message_type="task_result",
-                        additional_data={"filled_fields": actual_form_fields, "status": "recorded_fallback"}
-                    )
+                # 启动异步表单填写任务，不等待完成
+                asyncio.create_task(self._execute_form_filling_async(actual_form_fields))
                 
             else:
                 # 如果确实没有提取到字段，给用户反馈
                 original_input = form_data.get('original_user_input', '')
                 if original_input:
+                    request_message = f"我已收到您说的：'{original_input}'。请提供更具体的表单信息，如姓名、邮箱、电话等。"
+                    self.log(f"📤 立即请求Phone Agent提供更多信息: {request_message}")
                     await self._send_to_phone_agent(
-                        f"我已收到您说的：'{original_input}'。请提供更具体的表单信息，如姓名、邮箱、电话等。",
+                        request_message,
                         message_type="task_result"
                     )
                 else:
+                    general_request = "请提供需要填写的具体信息，如姓名、邮箱、电话号码等。"
+                    self.log(f"📤 立即请求Phone Agent提供信息: {general_request}")
                     await self._send_to_phone_agent(
-                        "请提供需要填写的具体信息，如姓名、邮箱、电话号码等。",
+                        general_request,
                         message_type="task_result"
                     )
+                
+                # 即使没有提取到字段也要发送任务完成通知让Phone Agent恢复录音
+                await self._notify_task_completion("form_filling", False, "未能提取到有效的表单数据")
             
         except Exception as e:
             self.log(f"处理表单数据失败: {e}")
             await self._send_to_phone_agent(f"处理您的信息时遇到问题: {str(e)}", message_type="error")
+            # 异常情况也要发送任务完成通知让Phone Agent恢复录音
+            await self._notify_task_completion("form_filling", False, f"表单填写出现异常: {str(e)}")
     
-    async def _execute_actual_form_filling(self, form_fields: dict) -> bool:
-        """创建新的browser-use agent执行表单填写"""
+    async def _execute_form_filling_async(self, form_fields: dict):
+        """异步执行表单填写，避免阻塞主线程"""
         try:
-            self.log(f"🚀 创建新的browser-use agent执行表单填写: {form_fields}")
+            self.log(f"🔄 异步执行表单填写: {form_fields}")
+            
+            # 执行实际的表单填写，设置较短的超时时间
+            try:
+                success = await asyncio.wait_for(
+                    self._execute_actual_form_filling(form_fields), 
+                    timeout=30.0  # 减少超时时间到30秒
+                )
+                
+                filled_info = [f"{k}: {v}" for k, v in form_fields.items()]
+                
+                if success:
+                    success_message = f"✅ 已成功在网页中填写: {', '.join(filled_info)}。"
+                    self.log(f"📤 通知Phone Agent填写成功: {success_message}")
+                    await self._send_to_phone_agent(
+                        success_message,
+                        message_type="task_result",
+                        additional_data={"filled_fields": form_fields, "status": "browser_filled"}
+                    )
+                    
+                    # 发送任务完成通知让Phone Agent恢复录音
+                    await self._notify_task_completion("form_filling", True, f"表单填写已完成: {', '.join(filled_info)}")
+                else:
+                    # 填写失败但至少记录信息
+                    fallback_message = f"⚠️ 网页填写遇到技术问题，但已记录您的信息: {', '.join(filled_info)}。"
+                    self.log(f"📤 通知Phone Agent填写问题: {fallback_message}")
+                    await self._send_to_phone_agent(
+                        fallback_message,
+                        message_type="task_result",
+                        additional_data={"filled_fields": form_fields, "status": "recorded_fallback"}
+                    )
+                    
+                    # 即使填写失败也发送任务完成通知让Phone Agent恢复录音
+                    await self._notify_task_completion("form_filling", False, f"表单填写遇到问题: {', '.join(filled_info)}")
+                    
+            except asyncio.TimeoutError:
+                # 超时处理
+                filled_info = [f"{k}: {v}" for k, v in form_fields.items()]
+                timeout_message = f"⚠️ 表单填写超时，但已记录您的信息: {', '.join(filled_info)}。"
+                self.log(f"📤 通知Phone Agent填写超时: {timeout_message}")
+                await self._send_to_phone_agent(
+                    timeout_message,
+                    message_type="task_result",
+                    additional_data={"filled_fields": form_fields, "status": "timeout"}
+                )
+                
+                # 超时也要发送任务完成通知让Phone Agent恢复录音
+                await self._notify_task_completion("form_filling", False, f"表单填写超时: {', '.join(filled_info)}")
+                
+        except Exception as e:
+            self.log(f"异步表单填写失败: {e}")
+            # 发生异常也要通知Phone Agent恢复录音
+            filled_info = [f"{k}: {v}" for k, v in form_fields.items()]
+            error_message = f"❌ 表单填写遇到错误，但已记录您的信息: {', '.join(filled_info)}。"
+            await self._send_to_phone_agent(
+                error_message,
+                message_type="task_result",
+                additional_data={"filled_fields": form_fields, "status": "error"}
+            )
+            
+            # 异常情况也要发送任务完成通知让Phone Agent恢复录音
+            await self._notify_task_completion("form_filling", False, f"表单填写异常: {str(e)}")
+
+    async def _execute_actual_form_filling(self, form_fields: dict) -> bool:
+        """使用现有的浏览器会话执行表单填写"""
+        try:
+            self.log(f"🚀 请求表单填写: {form_fields}")
             
             # 确保我们有实际的用户数据
             if not form_fields:
                 self.log("❌ 没有表单字段数据")
                 return False
             
-            # 使用LLM智能优化表单填写任务
-            optimized_task = await self._create_smart_form_filling_task(form_fields)
+            # 检查是否与上次填写的字段重复
+            if form_fields == self.last_filled_fields:
+                self.log(f"⚠️ 检测到重复的表单填写请求，跳过: {form_fields}")
+                await self._send_to_phone_agent(
+                    f"已经填写过相同的信息了。如需修改，请告诉我新的信息。",
+                    message_type="task_result"
+                )
+                return True
             
-            self.log(f"创建LLM优化的表单填写任务: {optimized_task[:200]}...")
+            # 检查是否有浏览器会话可用
+            if not hasattr(self, 'persistent_agent') or not self.persistent_agent:
+                self.log("❌ 没有可用的浏览器会话，创建新的")
+                # 如果没有持久会话，创建一个新的
+                return await self._create_new_form_filling_session(form_fields)
             
-            # 创建专门的填写agent
-            fill_agent = self._create_browser_agent(optimized_task)
-            if not fill_agent:
-                self.log("❌ 无法创建browser-use填写agent")
-                return False
+            # 使用现有会话填写表单
+            return await self._fill_form_with_existing_session(form_fields)
             
-            print(f"🔍 开始browser-use表单填写，使用用户数据: {form_fields}")
+        except Exception as e:
+            self.log(f"❌ 表单填写失败: {e}")
+            import traceback
+            self.log(f"错误详情: {traceback.format_exc()}")
+            return False
+    
+    async def _fill_form_with_existing_session(self, form_fields: dict) -> bool:
+        """使用现有的持久playwright浏览器会话执行表单填写"""
+        try:
+            self.log(f"使用现有playwright浏览器会话填写表单: {form_fields}")
             
-            # 执行填写任务
+            if not hasattr(self, 'browser_context') or not self.browser_context:
+                self.log("没有可用的playwright会话，创建新的")
+                return await self._create_new_form_filling_session(form_fields)
+            
+            # 创建表单填写任务
+            form_task = await self._create_persistent_form_filling_task(form_fields)
+            
+            # 使用现有的playwright会话创建新的agent
             try:
-                result = await asyncio.wait_for(fill_agent.run(), timeout=120.0)  # 增加超时时间
+                from browser_use import Agent
+                from browser_use.browser import BrowserSession
+                
+                # 确保使用已经导航的页面
+                fill_agent = Agent(
+                    browser_session=BrowserSession(
+                        browser_context=self.browser_context,
+                        page=self.current_page  # 指定使用已导航的页面
+                    ),
+                    task=form_task,
+                    llm=self.llm_client,
+                    max_actions_per_step=3,
+                    generate_gif=False,
+                    save_recording_path=None,
+                )
+                
+                self.log("开始使用现有playwright会话填写表单...")
+                self.log(f"🔍 调试信息 - 浏览器上下文: {self.browser_context}")
+                self.log(f"🔍 调试信息 - 当前页面: {self.current_page}")
+                
+                result = await asyncio.wait_for(fill_agent.run(), timeout=120.0)
+                self.log(f"表单填写完成: {result}")
+                
+                # 更新last_filled_fields
+                self.last_filled_fields = form_fields.copy()
+                
+                return True
+                
+            except asyncio.TimeoutError:
+                self.log("表单填写超时")
+                return False
+                
+        except Exception as e:
+            self.log(f"使用现有playwright会话填写表单失败: {e}")
+            import traceback
+            self.log(f"错误详情: {traceback.format_exc()}")
+            return False
+    
+    async def _create_new_form_filling_session(self, form_fields: dict) -> bool:
+        """创建新的playwright表单填写会话（当没有持久会话时）"""
+        try:
+            self.log(f"创建新的playwright表单填写会话: {form_fields}")
+            
+            # 如果还没有playwright会话，创建一个
+            if not hasattr(self, 'browser_context') or not self.browser_context:
+                from browser_use.browser.types import async_playwright
+                from browser_use.browser import BrowserSession
+                
+                self.playwright = await async_playwright().start()
+                self.browser = await self.playwright.chromium.launch(
+                    headless=self.config.headless,
+                )
+                
+                self.browser_context = await self.browser.new_context(
+                    viewport={'width': 1502, 'height': 853},
+                    ignore_https_errors=True,
+                )
+            
+            # 创建表单填写任务
+            form_task = await self._create_persistent_form_filling_task(form_fields)
+            
+            # 创建新的agent使用playwright会话
+            from browser_use import Agent
+            from browser_use.browser import BrowserSession
+            
+            # 如果有已导航的页面，使用它；否则创建新页面
+            page_to_use = self.current_page if hasattr(self, 'current_page') and self.current_page else None
+            if not page_to_use:
+                page_to_use = await self.browser_context.new_page()
+                self.current_page = page_to_use
+                # 导航到目标URL
+                if self.target_url:
+                    await page_to_use.goto(self.target_url)
+            
+            fill_agent = Agent(
+                browser_session=BrowserSession(
+                    browser_context=self.browser_context,
+                    page=page_to_use  # 使用已导航的页面或新创建并导航的页面
+                ),
+                task=form_task,
+                llm=self.llm_client,
+                max_actions_per_step=3,
+                generate_gif=False,
+                save_recording_path=None,
+            )
+            
+            self.log("开始新的playwright表单填写会话...")
+            result = await asyncio.wait_for(fill_agent.run(), timeout=120.0)
+            self.log(f"新playwright会话表单填写完成: {result}")
+            
+            # 更新last_filled_fields
+            self.last_filled_fields = form_fields.copy()
+            
+            return True
+            
+        except asyncio.TimeoutError:
+            self.log("新playwright会话表单填写超时")
+            return False
+        except Exception as e:
+            self.log(f"创建新playwright填写会话失败: {e}")
+            import traceback
+            self.log(f"错误详情: {traceback.format_exc()}")
+            return False
+    
+    async def _do_form_filling(self, form_fields: dict) -> bool:
+        """实际执行表单填写的内部方法"""
+        try:
+            self.log(f"🚀 开始执行表单填写: {form_fields}")
+            
+            # 使用LLM智能优化表单填写任务，但不自动关闭浏览器
+            optimized_task = await self._create_persistent_form_filling_task(form_fields)
+            
+            self.log(f"创建持久表单填写任务: {optimized_task[:200]}...")
+            
+            print(f"🔍 开始表单填写（持久浏览器会话），使用用户数据: {form_fields}")
+            
+            # 创建专门的表单填写agent - 不使用keep_alive，用特殊的任务设计
+            try:
+                from browser_use import Agent
+                
+                # 重新设计任务，让它填写后保持活跃状态
+                waiting_task = f"""
+Navigate to {self.target_url} if not already there. Fill the following form fields with the exact values provided:
+
+{chr(10).join(f"- Fill '{k}' field with: {v}" for k, v in form_fields.items() if v)}
+
+After filling these fields:
+1. Take a screenshot to confirm the fields are filled
+2. Wait on the page for 60 seconds to allow for additional operations
+3. Monitor the page for any changes or new requirements
+4. Only then call done() to complete this specific task
+
+This approach allows the form to be filled while keeping the browser session available for manual user operations.
+"""
+                
+                fill_agent = Agent(
+                    task=waiting_task,
+                    llm=self.llm_client,
+                    headless=self.config.headless,
+                )
+                
+                # 启动填写任务但不等待完全结束
+                self.log("启动表单填写任务...")
+                result = await asyncio.wait_for(fill_agent.run(), timeout=120.0)
                 self.log(f"✅ Browser-use表单填写完成: {result}")
+                
+                # 更新为当前活跃的浏览器agent
+                self.browser_agent = fill_agent
+                self.last_filled_fields = form_fields.copy()
+                
+                # 立即向Phone Agent发送成功消息
+                filled_info = [f"{k}: {v}" for k, v in form_fields.items()]
+                success_message = f"✅ 已成功填写: {', '.join(filled_info)}。网页保持打开状态，您可以继续填写其他信息或说'关闭网页'。"
+                self.log(f"📤 立即发送成功消息给Phone Agent: {success_message}")
+                await self._send_to_phone_agent(
+                    success_message,
+                    message_type="task_result",
+                    additional_data={"filled_fields": form_fields, "status": "success", "browser_active": True, "task_completed": True}
+                )
+                
+                # 发送表单填写任务完成通知
+                await self._notify_task_completion("form_filling", True, f"表单填写已完成: {', '.join(filled_info)}")
                 
                 # 检查结果是否表明成功
                 result_str = str(result).lower()
                 success_indicators = ["filled", "completed", "entered", "success", "screenshot"]
                 has_success = any(indicator in result_str for indicator in success_indicators)
                 
-                if has_success or len(str(result)) > 50:  # 如果结果有内容，通常表示有实际操作
-                    self.log("✅ Browser-use表单填写成功")
+                if has_success or len(str(result)) > 50:
+                    self.log("✅ Browser-use表单填写成功，浏览器保持活跃")
                     return True
                 else:
-                    self.log("⚠️ Browser-use执行完成但无明确成功指标")
-                    return True  # 仍然认为成功，因为执行完成了
+                    self.log("⚠️ Browser-use执行完成但无明确成功指标，浏览器保持活跃")
+                    return True
                         
             except asyncio.TimeoutError:
                 self.log("⚠️ Browser-use填写超时")
@@ -1174,6 +1641,109 @@ Browser-use分析结果:
             self.log(f"错误详情: {traceback.format_exc()}")
             return False
     
+    async def _create_persistent_form_filling_task(self, form_fields: dict) -> str:
+        """创建持久的表单填写任务，不自动关闭浏览器"""
+        try:
+            if not self.llm_client:
+                return self._create_basic_persistent_form_filling_task(form_fields)
+            
+            # 构建LLM优化提示 - 不自动关闭浏览器
+            optimization_prompt = f"""
+你是一个专业的网页表单填写专家。请根据以下用户数据，创建一个表单填写指令，用于browser-use框架填写 {self.target_url} 页面的表单。
+
+用户提供的数据：
+{json.dumps(form_fields, ensure_ascii=False, indent=2)}
+
+CRITICAL REQUIREMENTS:
+1. **ONLY fill the fields explicitly provided by the user above**
+2. **DO NOT fill any fields that are not in the user data**
+3. **DO NOT use placeholder, example, or default values**
+4. **DO NOT auto-complete or guess any information**
+5. **DO NOT submit the form**
+6. **After filling the fields, wait in an idle state - do not complete the task**
+
+INSTRUCTIONS:
+- Navigate to {self.target_url} if not already there
+- Fill ONLY the fields listed in the user data above
+- Use the EXACT values provided, do not modify them
+- Take a screenshot after filling to confirm
+- After completing the form filling, enter a waiting state
+- Keep monitoring the page for further instructions
+- DO NOT call done() automatically - wait for explicit completion signal
+
+The task should remain active and ready for additional form filling operations.
+
+Please return the complete task instruction in English, suitable for browser-use framework.
+"""
+            
+            try:
+                # 调用LLM优化任务
+                if hasattr(self.llm_client, 'chat') and hasattr(self.llm_client.chat, 'completions'):
+                    response = await self.llm_client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[
+                            {"role": "system", "content": "You are an expert at creating browser automation tasks for form filling."},
+                            {"role": "user", "content": optimization_prompt}
+                        ],
+                        temperature=0.1,
+                        max_tokens=500
+                    )
+                    optimized_task = response.choices[0].message.content.strip()
+                else:
+                    # 使用直接的OpenAI客户端
+                    from openai import AsyncOpenAI
+                    import os
+                    
+                    openai_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+                    response = await openai_client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[
+                            {"role": "system", "content": "You are an expert at creating browser automation tasks for form filling."},
+                            {"role": "user", "content": optimization_prompt}
+                        ],
+                        temperature=0.1,
+                        max_tokens=500
+                    )
+                    optimized_task = response.choices[0].message.content.strip()
+                
+                self.log(f"LLM持久任务优化完成: {optimized_task[:100]}...")
+                return optimized_task
+                
+            except Exception as llm_error:
+                self.log(f"LLM任务优化失败，使用基础任务: {llm_error}")
+                return self._create_basic_persistent_form_filling_task(form_fields)
+                
+        except Exception as e:
+            self.log(f"创建持久表单任务失败: {e}")
+            return self._create_basic_persistent_form_filling_task(form_fields)
+    
+    def _create_basic_persistent_form_filling_task(self, form_fields: dict) -> str:
+        """创建基础持久表单填写任务（备选方案）"""
+        instructions = []
+        for field_name, value in form_fields.items():
+            if value:
+                instructions.append(f"Fill the {field_name} field with: {value}")
+        
+        return f"""
+Navigate to {self.target_url} and fill ONLY the user-provided form fields:
+
+{chr(10).join(f"- {instruction}" for instruction in instructions)}
+
+CRITICAL REQUIREMENTS:
+1. Navigate to the page first if not already there
+2. ONLY fill the fields listed above - DO NOT fill any other fields
+3. DO NOT use placeholder, example, or default values
+4. Fill each field with the EXACT value specified above
+5. DO NOT auto-complete or guess any missing information
+6. Take your time and wait for elements to load
+7. Do NOT submit the form
+8. Take a screenshot after filling to confirm success
+9. After filling, enter a waiting state to monitor for further instructions
+10. DO NOT call done() automatically - wait for explicit completion signal
+
+IMPORTANT: Only fill the {len(instructions)} fields listed above. The task should remain active for additional operations.
+"""
+    
     async def _create_smart_form_filling_task(self, form_fields: dict) -> str:
         """使用LLM智能创建表单填写任务，无硬编码映射"""
         try:
@@ -1181,28 +1751,36 @@ Browser-use分析结果:
                 # 降级到基础任务
                 return self._create_basic_form_filling_task(form_fields)
             
-            # 构建LLM优化提示
+            # 构建LLM优化提示 - 严格限制只填写用户提供的信息
             optimization_prompt = f"""
-你是一个专业的网页表单填写专家。请根据以下用户数据，创建一个详细的表单填写指令，用于browser-use框架自动填写 {self.target_url} 页面的表单。
+你是一个专业的网页表单填写专家。请根据以下用户数据，创建一个严格的表单填写指令，用于browser-use框架自动填写 {self.target_url} 页面的表单。
 
-用户提供的数据：
+用户提供的数据（ONLY fill these fields）：
 {json.dumps(form_fields, ensure_ascii=False, indent=2)}
 
-请分析每个字段的含义，并创建清晰的英文填写指令。对于特殊字段类型，请提供适当的操作说明：
+CRITICAL REQUIREMENTS - MUST FOLLOW:
+1. **ONLY fill the fields explicitly provided by the user above**
+2. **DO NOT fill any fields that are not in the user data**
+3. **DO NOT use placeholder, example, or default values**
+4. **DO NOT fill email with "example@example.com" or phone with "1234567890"**
+5. **DO NOT auto-complete or guess any information**
 
-1. 对于中文内容，保持原文（姓名、地址等个人信息）
-2. 对于选择性字段（如尺寸、配料），请提供清晰的选择指令
-3. 对于时间字段，确保格式正确
-4. 对于数组类型的字段（如配料列表），请展开为多个操作
+For each field in the user data:
+- Use the EXACT value provided by the user
+- Keep Chinese names and text as-is (do not translate)
+- For time fields, use the exact format provided
+- For array fields (like toppings), select only the specified items
 
-要求：
-- 使用清晰的英文指令，适合browser-use理解
-- 每个字段一个具体的操作指令
-- 包含必要的导航和确认步骤
-- 不要提交表单，只填写
-- 最后要求截图确认
+STRICT INSTRUCTIONS:
+- Navigate to {self.target_url} if not already there
+- Fill ONLY the fields listed in the user data above
+- Use the EXACT values provided, do not modify them
+- DO NOT fill any other fields on the page
+- DO NOT submit the form
+- Take a screenshot after filling to confirm
+- After completing all form filling, call done() to finish the task
 
-请直接返回完整的任务指令，不要包含任何解释或格式标记。
+Please return the complete task instruction in English, suitable for browser-use framework.
 """
             
             try:
@@ -1254,19 +1832,22 @@ Browser-use分析结果:
                 instructions.append(f"Fill the {field_name} field with: {value}")
         
         return f"""
-Navigate to {self.target_url} and fill out the form with the following information:
+Navigate to {self.target_url} and fill ONLY the user-provided form fields:
 
 {chr(10).join(f"- {instruction}" for instruction in instructions)}
 
-Requirements:
+CRITICAL REQUIREMENTS:
 1. Navigate to the page first if not already there
-2. Find each form field by its label, name, or placeholder
-3. Fill each field with the EXACT value specified above
-4. Take your time and wait for elements to load
-5. Do NOT submit the form
-6. Take a screenshot after filling to confirm success
+2. ONLY fill the fields listed above - DO NOT fill any other fields
+3. DO NOT use placeholder, example, or default values like "example@example.com" or "1234567890"
+4. Fill each field with the EXACT value specified above
+5. DO NOT auto-complete or guess any missing information
+6. Take your time and wait for elements to load
+7. Do NOT submit the form
+8. Take a screenshot after filling to confirm success
+9. After completing all form filling, call done() to finish the task
 
-Work step by step and be patient with element loading times.
+IMPORTANT: Only fill the {len(instructions)} fields listed above. Do not fill any other fields on the page.
 """
     
     async def _execute_browser_form_filling(self, form_fields: dict):
@@ -1413,9 +1994,20 @@ Work step by step and be patient with element loading times.
                     result_text = result_text.replace('```', '').strip()
                 
                 intent_analysis = json.loads(result_text)
+                intent_type = intent_analysis.get("intent_type", "other")
                 suggested_response = intent_analysis.get("suggested_response", "我正在分析您的请求，请稍等")
                 
-                await self._send_to_phone_agent(suggested_response, message_type="task_result")
+                self.log(f"LLM意图分析结果: {intent_analysis}")
+                self.log(f"意图类型: {intent_type}")
+                
+                # 根据意图类型执行实际操作
+                if intent_type == "navigation":
+                    # 这是导航请求，执行实际的浏览器操作
+                    await self._handle_navigation_request(user_text, intent_analysis)
+                else:
+                    # 其他类型的请求，发送分析结果
+                    self.log(f"发送给Phone Agent的响应: {suggested_response}")
+                    await self._send_to_phone_agent(suggested_response, message_type="task_result")
                 
             except Exception as llm_error:
                 self.log(f"LLM意图分析失败: {llm_error}")
@@ -2142,6 +2734,59 @@ Browser-use分析结果:
             self.log(f"执行表单填写任务失败: {e}")
             raise
     
+    async def _create_persistent_browser_session(self):
+        """创建持久浏览器会话，保持页面活跃状态"""
+        try:
+            from browser_use import Agent
+            
+            # 创建一个待机任务，保持浏览器会话但不执行任何操作
+            persistent_task = f"""You are now in standby mode on {self.target_url}. 
+
+INSTRUCTIONS:
+1. The page is already loaded and analyzed
+2. DO NOT navigate away from this page
+3. DO NOT fill any forms yet
+4. DO NOT call done() - stay active and wait
+5. Monitor the page for any changes
+6. Wait for further instructions for form filling operations
+
+Stay idle and ready to receive form filling commands."""
+            
+            # 创建新的持久agent
+            self.persistent_agent = Agent(
+                task=persistent_task,
+                llm=self.llm_client,
+                headless=self.config.headless,
+                max_actions_per_step=1,
+                generate_gif=False,
+                save_recording_path=None,
+            )
+            
+            # 不等待这个任务完成，让它在后台保持活跃
+            self.persistent_task = asyncio.create_task(self.persistent_agent.run())
+            self.log("✅ 创建持久浏览器会话，保持页面活跃")
+            
+        except Exception as e:
+            self.log(f"创建持久浏览器会话失败: {e}")
+
+    async def _notify_task_completion(self, task_type: str, success: bool, message: str):
+        """通知任务完成状态"""
+        try:
+            self.log(f"📤 发送任务完成通知: {task_type} - {'成功' if success else '失败'}")
+            
+            await self._send_to_phone_agent(
+                message,
+                message_type="task_completion",
+                additional_data={
+                    "task_type": task_type,
+                    "success": success,
+                    "completion_time": time.time(),
+                    "can_resume_recording": True  # 重要：告诉Phone Agent可以恢复录音
+                }
+            )
+        except Exception as e:
+            self.log(f"发送任务完成通知失败: {e}")
+
     async def _send_to_phone_agent(self, message: str, message_type: str = "task_result", 
                                   additional_data: Optional[Dict[str, Any]] = None):
         """发送消息给Phone Agent"""
@@ -2279,12 +2924,42 @@ Browser-use分析结果:
         return "\n".join(instructions)
     
     async def stop(self):
-        """停止Computer Agent"""
+        """停止Computer Agent并清理playwright资源"""
         self.log("停止IntelligentComputerAgent")
         
         try:
             # 停止工具调用处理器
             self.tool_handler.stop()
+            
+            # 取消工具任务
+            if hasattr(self, 'tool_task') and self.tool_task:
+                self.tool_task.cancel()
+                try:
+                    await self.tool_task
+                except asyncio.CancelledError:
+                    pass
+            
+            # 清理playwright资源
+            if hasattr(self, 'browser_context') and self.browser_context:
+                try:
+                    await self.browser_context.close()
+                    self.log("✅ 浏览器上下文已清理")
+                except Exception as e:
+                    self.log(f"清理浏览器上下文失败: {e}")
+            
+            if hasattr(self, 'browser') and self.browser:
+                try:
+                    await self.browser.close()
+                    self.log("✅ 浏览器已清理")
+                except Exception as e:
+                    self.log(f"清理浏览器失败: {e}")
+            
+            if hasattr(self, 'playwright') and self.playwright:
+                try:
+                    await self.playwright.stop()
+                    self.log("✅ Playwright已清理")
+                except Exception as e:
+                    self.log(f"清理playwright失败: {e}")
             
             self.log("IntelligentComputerAgent已停止")
             
